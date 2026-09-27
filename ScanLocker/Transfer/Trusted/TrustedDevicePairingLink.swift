@@ -1,94 +1,13 @@
-//
-//  TrustedDevicePairingLink.swift
-//  ScanLocker
-//
-//  ================= WHAT THIS FILE IS =================
-//  Pairing two devices in the same room, over the radio the owner picks.
-//  The two find each other through a `PairingTransport`, which is an L2CAP
-//  channel for Bluetooth and a Bonjour-advertised TCP socket for Wi-Fi. Everything below the pipe is the same on both: one shows
-//  a six-digit PIN and the other types it, and the PIN authenticates the
-//  exchange of the two public keys that every later transfer between them
-//  rests on. Nothing here touches the vault; the outcome is handed to the
-//  store, which writes the record.
-//
-//  ================= THE HANDSHAKE =================
-//  The device showing the PIN is the host; the device typing it is the joiner.
-//
-//    1  joiner → host   HELLO      joiner's public key, joiner's nonce
-//    2  host → joiner   CHALLENGE  pairing id, host's public key, host's
-//                                  nonce, host's CPace point
-//    3  joiner → host   PROVE      joiner's CPace point, then a tag over the
-//                                  whole transcript keyed by the session key
-//    4  host → joiner   ACCEPT     a tag over the same transcript under a
-//                                  different label, or REJECT
-//    5  host → joiner   INFO       the host's description of itself, sealed
-//                                  under a key only the two static keys reach
-//    6  joiner → host   INFO       the joiner's, the same way
-//
-//  The PIN authenticates through CPace, a balanced password-authenticated
-//  key exchange (draft-irtf-cfrg-cpace, suite CPace255 with SHA-512). Both
-//  sides hash the PIN with a session identifier they both contributed and
-//  the channel identifier below, map the hash onto Curve25519 through
-//  Field25519 and use that point as the generator of one Diffie-Hellman
-//  exchange. Each CPace point on the air is a fresh random scalar times that
-//  generator, so it is consistent with every PIN and tests none: a device
-//  that pretends to be the host learns nothing it can try against candidate
-//  PINs afterwards. A wrong PIN on either side gives a different generator,
-//  an unrelated shared point and a tag that does not verify. The session
-//  key is HKDF-SHA256 over the shared point with the transcript as salt,
-//  and the two tags are HMAC-SHA256 under it. A shared point that is the
-//  neutral element, which a low-order point produces, is refused before any
-//  key is derived.
-//
-//  The joiner proves first, so a stranger who connects to the host learns
-//  nothing keyed by the session before they have shown they hold the PIN.
-//  The descriptions travel only after both sides have proved the PIN and
-//  only sealed, so a device name is never on the air in the clear.
-//
-//  A PIN is shown once. The first handshake that starts and does not
-//  complete retires it: a tag that does not verify, a connection that drops
-//  after HELLO, a deadline that expires after HELLO, or anything unreadable
-//  on the wire after HELLO. The host then stops advertising, tells the
-//  joiner with REJECT where one is still connected and says so on its own
-//  screen beside Show a New PIN. Under CPace a guess can only be tested by
-//  attempting a handshake, so this bounds an attacker to one guess per shown
-//  PIN. HELLO is the line, because the host sends nothing derived from the
-//  PIN before it has HELLO in hand: a host waiting with nobody connected, or
-//  with a joiner that connected and sent nothing, retires nothing and keeps
-//  waiting, since nothing has been attempted against the PIN and a radio
-//  that failed to connect should not cost one. Every wait for the other
-//  side's next message has a twenty-second deadline, which under CPace bounds
-//  only how long the other device may take to answer. Finding the other
-//  device has no deadline; the person can see it is searching and Cancel
-//  ends it.
-//
-//  Before the first pairing after each launch the link evaluates one of the
-//  draft's published vectors through Field25519 and CryptoKit. It refuses
-//  to pair when the result does not match, so arithmetic gone wrong on some
-//  chip never derives a key. The refusal runs in every build and sends
-//  nothing.
-//
-//  Both devices advertise as "ScanLocker-" plus four random letters, never
-//  as the device's own name. The host shows its four letters under the PIN
-//  so the joiner picks the right device in a room with more than one.
-//
-
 import Combine
 import CryptoKit
 import Foundation
 
 @MainActor
 final class TrustedDevicePairingLink: NSObject, ObservableObject {
-
-    /// The Bonjour service the Wi-Fi pipe publishes. It is its own type, so a
-    /// pairing never answers a browser looking for a transfer.
     static let bonjourType = "_sl-pair._tcp"
     static let handshakeDeadline: TimeInterval = 20
-    /// The backstop over a remote joiner's reach. Every step of the remote
-    /// pipe ends by a deadline of its own, and those add up to under this.
     static let remoteConnectDeadline: TimeInterval = 130
     static let pinLength = 6
-    /// Ceiling on a sealed description before any of it is opened.
     static let maxInfoBytes = 512
 
     struct Outcome: Equatable {
@@ -98,45 +17,28 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         let theirDescription: DeviceDescription
     }
 
-    /// A device offering to pair. The transport resolves the identifier back
-    /// to its own handle, so neither this link nor the screen holds a type
-    /// belonging to one radio.
     typealias FoundDevice = PairingPeer
 
     enum Role { case host, join }
-
-    // MARK: - What the screen reads
 
     @Published private(set) var status = ""
     @Published private(set) var errorText: String?
     @Published private(set) var found: [FoundDevice] = []
     @Published private(set) var outcome: Outcome?
     @Published private(set) var pinRetired = false
-    /// True when the self-test refused to pair, so the screen shows neither
-    /// a PIN nor a search.
     @Published private(set) var refused = false
-    /// True from the invitation until the handshake ends, one way or the other.
     @Published private(set) var busy = false
-    /// True when the chosen radio would not start. The screen reads this and
-    /// returns to the step that picks a radio, so the other one is one tap
-    /// away rather than a whole flow away.
     @Published private(set) var radioFailed = false
-    /// The three digits the rendezvous gave a remote host, once they stand.
     @Published private(set) var remoteSlot: String?
 
     private(set) var pin = ""
     private(set) var deviceTag = ""
     private(set) var role: Role?
-    /// Which radio this attempt runs on. The screen picks it before either
-    /// side commits to showing or typing a PIN.
     private(set) var radio: PairingRadio = .nearby
 
-    /// The nine digits a remote host reads aloud: the slot, then the PIN.
     var remoteCode: RemotePairingCode? {
         remoteSlot.flatMap { RemotePairingCode(slot: $0, pin: pin) }
     }
-
-    // MARK: - Wire
 
     private enum MessageType: UInt8 {
         case hello = 0x01
@@ -146,8 +48,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         case reject = 0x05
         case info = 0x06
 
-        /// Fixed for every message but INFO, whose sealed body varies and is
-        /// bounded instead.
         var bodyLength: Int? {
             switch self {
             case .hello: return 32 + 16
@@ -162,36 +62,20 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
 
     private enum Phase {
         case idle
-        /// Host: connected, waiting for HELLO.
         case awaitingHello
-        /// Joiner: HELLO sent, waiting for CHALLENGE.
         case awaitingChallenge
-        /// Host: CHALLENGE sent, waiting for PROVE.
         case awaitingProve
-        /// Joiner: PROVE sent, waiting for ACCEPT or REJECT.
         case awaitingAccept
-        /// Both: PIN proved both ways, waiting for the other's description.
         case awaitingInfo
         case done
     }
 
-    /// CPace's channel identifier and the first field of the transcript.
-    /// It moved from v1 to v2 with the exchange, since the wire changed.
     private static let channelIdentifier = Data("scanlocker.trusted.pairing.v2".utf8)
-    /// How long the last message of an attempt is given to leave before the
-    /// session drops: the final INFO on success, REJECT on retirement. One
-    /// second is many times a datagram's crossing between two devices in one
-    /// room. finish and retire take the same bound.
     private static let lastMessageGrace: TimeInterval = 1
-    /// The two sentences the wire can earn before any PIN is involved,
-    /// written once.
     private static let unreadable = "This device could not read the other device\u{2019}s reply"
     private static let couldNotPrepare = "This device could not start pairing"
     private static let retiredReason: UInt8 = 0xFF
-    /// The smallest AES-GCM box: nonce and tag around an empty message.
     private static let minSealedBytes = 12 + 16
-
-    // MARK: - State
 
     private var phase: Phase = .idle
     private var myKeys = TrustedDeviceCrypto.KeyPair.generate()
@@ -201,14 +85,8 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
     private var lifetimeGeneration = 0
     private var enteredPIN = ""
 
-    /// How long a search may run in silence before the status says what to
-    /// check. The search itself has no deadline; Cancel ends it.
     private static let stallHintAfter: TimeInterval = 30
 
-    /// Fill or kill for the PIN a host shows. Five minutes is long enough to
-    /// carry the code to the other iPhone, and it ends the one wait that
-    /// otherwise held a live PIN advertised until the sheet closed. Show a
-    /// New PIN mints another.
     private static let pinLifetime: TimeInterval = 300
 
     private var pairingID = Data()
@@ -216,17 +94,11 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
     private var joinerNonce = Data()
     private var hostPub = Data()
     private var hostNonce = Data()
-    /// The two CPace points, host's then joiner's.
     private var hostPoint = Data()
     private var joinerPoint = Data()
-    /// This side's scalar for the exchange, kept from its own point until
-    /// the shared point is derived and forgotten with the session key.
     private var exchangeScalar: Curve25519.KeyAgreement.PrivateKey?
     private var sessionKey: SymmetricKey?
 
-    // MARK: - Starting and stopping
-
-    /// Show a PIN on this device and wait for the other one to connect.
     func startHosting(radio: PairingRadio) {
         stop()
         self.radio = radio
@@ -248,7 +120,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         armPINLifetime()
     }
 
-    /// Look for a device that is showing a PIN.
     func startBrowsing(radio: PairingRadio) {
         stop()
         self.radio = radio
@@ -262,13 +133,11 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         myKeys = .generate()
         openTransport().startBrowsing(tag: deviceTag)
         phase = .idle
-        // Nothing is searched for on the remote route, so nothing is said.
         guard radio != .remote else { return }
         status = "Looking for a device that is showing a PIN."
         armStallHint("No device showing a PIN has been found yet. " + radio.checkLine)
     }
 
-    /// Connect to the chosen device with the PIN it shows.
     func join(_ device: FoundDevice, pin: String) {
         guard role == .join, let transport, busy == false, outcome == nil else { return }
         enteredPIN = pin
@@ -281,10 +150,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         armDeadline()
     }
 
-    /// Reach the device showing these nine digits. Each try runs on a fresh
-    /// pipe, so nothing of a spent code is still standing under it. The
-    /// deadline covers every step of the pipe and falls to the handshake's
-    /// own once the two devices are connected.
     func joinRemote(code: RemotePairingCode) {
         guard radio == .remote, role == .join, busy == false, outcome == nil else { return }
         transport?.stop()
@@ -317,8 +182,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         forgetExchange()
     }
 
-    // MARK: - The handshake
-
     private func connected() {
         guard outcome == nil else { return }
         switch role {
@@ -343,9 +206,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
     }
 
     private func received(_ data: Data) {
-        // Nothing is under way, or the pairing is already done, so this is a
-        // straggler from an attempt that has ended and been reported. It
-        // changes nothing.
         guard phase != .idle, phase != .done, outcome == nil else { return }
         guard let first = data.first, let type = MessageType(rawValue: first) else {
             fail(Self.unreadable)
@@ -440,8 +300,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
             armDeadline()
 
         case (.join, .awaitingAccept, .reject):
-            // The one byte always says retired; a REJECT is the host saying
-            // this PIN is spent, whatever ended the attempt there.
             pinRetired = true
             endAttempt("The other device retired its \(radio.secretWord), so the pairing stopped. Ask them to show a new one.")
 
@@ -459,8 +317,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         }
     }
 
-    /// Sends this device's description, sealed under the pairing key. False
-    /// means the pairing has already been failed and reported.
     private func sendInfo() -> Bool {
         guard let key = pairingKey(),
               let json = try? JSONEncoder().encode(DeviceDescription.thisDevice),
@@ -491,16 +347,9 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
                           theirPublicKey: theirPublicKey, theirDescription: description)
         forgetExchange()
         transport?.stopDiscovery()
-        // The last message needs a moment to leave before the pipe drops.
         transport?.resetConnection(after: Self.lastMessageGrace, readyForAnother: false)
     }
 
-    /// Ends the attempt with its cause named first. On the host that has
-    /// HELLO in hand the PIN is retired with it, since a handshake that
-    /// started and did not complete has spent the PIN. Everywhere else, on
-    /// the joiner and on a host that nobody has sent HELLO to, the attempt
-    /// ends, the host goes back to waiting and the sentence says so. `cause`
-    /// is the clause before the comma. The outcome is written once here.
     private func fail(_ cause: String) {
         if role == .host, phase == .awaitingProve || phase == .awaitingInfo {
             retire(cause: cause)
@@ -509,9 +358,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         }
     }
 
-    /// The host's way out: advertising stops, the joiner still connected is
-    /// told with REJECT and the screen says what happened beside Show a
-    /// New PIN. The one byte of REJECT always reads retired.
     private func retire(cause: String) {
         retire(saying: radio == .remote
             ? "\(cause), so this code is retired. Tap Show a New Code to start again."
@@ -523,32 +369,21 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         lifetimeGeneration += 1
         transport?.stopAdvertising()
         let told = transport?.send(Data([MessageType.reject.rawValue, Self.retiredReason])) == true
-        // REJECT needs the same moment to leave that finish gives the last
-        // INFO. Without it the joiner sees a dropped connection and does not
-        // learn the PIN is retired.
         endAttempt(message, disconnectAfter: told ? Self.lastMessageGrace : 0)
     }
 
     private func endAttempt(_ message: String, disconnectAfter grace: TimeInterval = 0) {
         deadlineGeneration += 1
         forgetExchange()
-        // The joiner keeps browsing and needs a pipe that has not been torn
-        // down for its next try. A host whose PIN is retired keeps none, since
-        // it advertises nothing until Show a New PIN.
         transport?.resetConnection(after: grace,
                                    readyForAnother: role == .join || pinRetired == false)
         phase = .idle
         busy = false
         errorText = message
         status = role == .host && pinRetired == false ? "Waiting for the other device." : ""
-        // A host that goes back to waiting is showing the PIN again, so the
-        // wait for it to be typed takes a fresh bound. A host that reached
-        // the proving phase has already retired and takes none.
         if role == .host, pinRetired == false, outcome == nil { armPINLifetime() }
     }
 
-    /// Fill or kill: every wait for the other side's next message ends here
-    /// if the message never comes.
     private func armDeadline(_ given: TimeInterval? = nil) {
         let seconds = given ?? Self.handshakeDeadline
         deadlineGeneration += 1
@@ -562,8 +397,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         }
     }
 
-    /// After thirty seconds of nothing, the status names what to check. It
-    /// is a hint and never an abandonment: the search goes on until Cancel.
     private func armStallHint(_ message: String) {
         hintGeneration += 1
         let generation = hintGeneration
@@ -575,9 +408,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         }
     }
 
-    /// Fill or kill for a PIN nobody types. The advertising stops and the
-    /// code is spent, so the screen carries one sentence and Show a New PIN
-    /// is the way on.
     private func armPINLifetime() {
         lifetimeGeneration += 1
         let generation = lifetimeGeneration
@@ -591,11 +421,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         }
     }
 
-    /// One evaluation of the draft's vector per launch, before the first
-    /// pairing. The answer is kept for every pairing after it. A
-    /// mismatch means the field arithmetic or CryptoKit gave a wrong answer
-    /// on this device. A key derived from a wrong answer would be a key
-    /// nobody else can reach or one somebody else can, so nothing is sent.
     private static var arithmeticVerified: Bool?
 
     private func arithmeticStands() -> Bool {
@@ -608,8 +433,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         return verified
     }
 
-    /// The self-test did not match. No radio starts, so nothing keyed by
-    /// the arithmetic ever leaves this device.
     private func refuseToPair() {
         deadlineGeneration += 1
         hintGeneration += 1
@@ -621,23 +444,15 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         errorText = "This device's pairing arithmetic did not pass its check, so it will not pair. Nothing was sent."
     }
 
-    /// The radio could not be started at all: permission refused, or
-    /// Bluetooth and Wi-Fi both off. Said plainly, so the screen never shows
-    /// a search that is not happening.
     private func couldNotStart() {
         deadlineGeneration += 1
         hintGeneration += 1
         lifetimeGeneration += 1
         transport?.stopDiscovery()
-        // A radio that cannot start may still be holding a connection that
-        // arrived before it failed, and nothing else would close it once the
-        // deadline below is stood down.
         transport?.resetConnection(after: 0, readyForAnother: false)
         phase = .idle
         busy = false
         status = ""
-        // The remote pipe names the step that failed. Its host has no slot
-        // left, so the code on screen is spent and a new one is the way on.
         errorText = remoteWords ?? radio.couldNotStartLine
         if radio == .remote, role == .host {
             pinRetired = true
@@ -646,15 +461,10 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         }
     }
 
-    /// The sentence of the remote pipe's last failed step, or nil.
     private var remoteWords: String? {
         (transport as? PairingRemoteTransport)?.words
     }
 
-    // MARK: - Pieces
-
-    /// The pipe this pairing runs over, stopped and rebuilt for each attempt
-    /// so nothing from an abandoned one is still listening.
     @discardableResult
     private func openTransport() -> PairingTransport {
         let made: PairingTransport = switch radio {
@@ -673,8 +483,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         return made
     }
 
-    /// False means the send failed and the attempt has already been ended
-    /// and reported, so the caller returns without another word.
     private func send(_ type: MessageType, body: Data) -> Bool {
         var message = Data([type.rawValue])
         message.append(body)
@@ -685,11 +493,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         return true
     }
 
-    /// This side's CPace point for a PIN: the generator for that PIN and
-    /// this session, times a scalar drawn fresh for this handshake. The
-    /// session identifier is the pairing id and both nonces, so both devices
-    /// contributed to it and neither chose it alone. Nil when the device's
-    /// arithmetic or randomness refused, which is not a state to pair in.
     private func exchangePoint(pin: String) -> Data? {
         let sessionID = pairingID + joinerNonce + hostNonce
         guard let generator = CPace255.generator(prs: Data(pin.utf8), ci: Self.channelIdentifier, sid: sessionID) else {
@@ -701,10 +504,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         return point
     }
 
-    /// The session key for this handshake. Nil when the shared point is the
-    /// neutral element, which a low-order point from the other side
-    /// produces, or when this side holds no scalar. The shared point itself
-    /// never leaves this function.
     private func deriveSessionKey(theirPoint: Data) -> SymmetricKey? {
         guard let scalar = exchangeScalar,
               let shared = try? CPace255.multiply(scalar, times: theirPoint) else { return nil }
@@ -716,8 +515,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         sessionKey = nil
     }
 
-    /// The channel identifier, then every field of HELLO and CHALLENGE, then
-    /// the joiner's point, in the order they crossed the air.
     private func transcript() -> Data {
         var t = Self.channelIdentifier
         t.append(joinerPub)
@@ -738,15 +535,12 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         HMAC<SHA256>.isValidAuthenticationCode(tag, authenticating: Data(label.utf8) + transcript(), using: key)
     }
 
-    /// Four letters and digits with no look-alikes.
     private static func randomTag() -> String {
         let alphabet = Array("ABCDEFGHJKMNPQRSTUVWXYZ23456789")
         guard let bytes = try? TrustedDeviceCrypto.randomBytes(4) else { return "XXXX" }
         return String(bytes.map { alphabet[Int($0) % alphabet.count] })
     }
 }
-
-// MARK: - What the pipe reports
 
 extension TrustedDevicePairingLink: PairingTransportDelegate {
     func pairingTransportDidConnect() {
@@ -758,10 +552,7 @@ extension TrustedDevicePairingLink: PairingTransportDelegate {
     }
 
     func pairingTransportDidDrop() {
-        // A drop in the middle of the handshake is a failure the deadline
-        // would otherwise report twenty seconds late.
         guard outcome == nil, phase != .idle else { return }
-        // A remote joiner's pipe says which step of the reach failed.
         if role == .join, phase == .awaitingChallenge, let said = remoteWords {
             endAttempt(said)
         } else {
@@ -779,12 +570,8 @@ extension TrustedDevicePairingLink: PairingTransportDelegate {
     }
 
     func pairingTransportShouldAccept() -> Bool {
-        // Accepting only opens the handshake. Nothing keyed by the PIN leaves
-        // this device until the joiner has proved the PIN.
         let accept = outcome == nil && pinRetired == false && busy == false
         if accept {
-            // The deadline starts here, so a joiner that is accepted and then
-            // never connects cannot leave this device busy forever.
             busy = true
             phase = .awaitingHello
             armDeadline()

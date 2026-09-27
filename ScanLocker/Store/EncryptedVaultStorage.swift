@@ -1,31 +1,10 @@
-//
-//  EncryptedVaultStorage.swift
-//  ScanLocker
-//
-//  The sealed store under the catalog. It reads and writes the blobs, and it
-//  neither shares, audits nor captures.
-//
-
 import CryptoKit
 import Foundation
 import UIKit
 
 final class EncryptedVaultStorage {
-
-    /// The tab key and the Vault key, held while the app is in use and
-    /// dropped by `purgeKeys` at every lock and every move to the
-    /// background, to re-derive from the Keychain on the next access. Neither
-    /// sits unwrapped for the life of the process. Both sit behind
-    /// `ringLock` with the ring, because the decrypt queue and the ingest
-    /// queue read them while the main thread may purge.
     private var cachedKey: SymmetricKey?
     private var cachedVaultFolderKey: SymmetricKey?
-    /// Every key this phone can open a Scan blob with, by identifier: the
-    /// two local keys and every twin of a Scan tab key the Keychain holds.
-    /// The Keychain is its only source, it is read at launch and again by
-    /// `reloadRing` before every cloud operation, and it is never written to
-    /// a file. Read from the decrypt queue, so it goes through `ringLock`,
-    /// and a purge empties it with the keys.
     private var ring: [Data: SymmetricKey] = [:]
     private let ringLock = NSLock()
     private let rootURL: URL
@@ -33,9 +12,6 @@ final class EncryptedVaultStorage {
     private let metaURL: URL
     private let lockerURL: URL
 
-    /// The one place the vault's on-disk location is spelled. The
-    /// fresh-install guard reads the same paths, so the two can never
-    /// disagree about where the catalogs live.
     static var containerURL: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -44,16 +20,9 @@ final class EncryptedVaultStorage {
 
     static var vaultIndexURL: URL { containerURL.appendingPathComponent("vault.enc") }
     static var lockerIndexURL: URL { containerURL.appendingPathComponent("locker.enc") }
-    /// The devices this iPhone trusts for Transfer.
     static var trustedIndexURL: URL { containerURL.appendingPathComponent("trusted.enc") }
-    /// The security event log. It carries the names the owner typed, so it
-    /// is sealed and kept out of backups exactly as the two catalogs are.
     static var auditIndexURL: URL { containerURL.appendingPathComponent("audit.enc") }
 
-    /// True only when both AES keys were read back from the Keychain at
-    /// launch. No in-memory-only key. Answered once: a key that was there at
-    /// launch and will not answer for a moment after a purge refuses that
-    /// one call and never closes the store.
     let isDurableKeyReady: Bool
 
     init() {
@@ -75,14 +44,6 @@ final class EncryptedVaultStorage {
         reloadRing()
     }
 
-    // MARK: The keys, the ring, and the tab key's twin
-
-    /// Both keys, from the cache or read back from the Keychain. Called with
-    /// `ringLock` held by every reader. The read goes through the functions
-    /// the launch uses, which mint only when the Keychain says explicitly
-    /// that nothing is stored, so a purged key comes back as the same bytes
-    /// or as nothing and never as a replacement. Nil is one refused call,
-    /// and the next access reads again.
     private func loadedKeysLocked() -> (tab: SymmetricKey, vaultFolder: SymmetricKey)? {
         if let cachedKey, let cachedVaultFolderKey { return (cachedKey, cachedVaultFolderKey) }
         #if DEBUG
@@ -95,18 +56,12 @@ final class EncryptedVaultStorage {
         cachedVaultFolderKey = vaultFolder
         rebuildRingLocked(tab: tab, vaultFolder: vaultFolder)
         #if DEBUG
-        // One Keychain read and one Enclave agreement, timed in
-        // milliseconds, with nothing of the keys in the line.
         let millis = Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000
         print(String(format: "ScanLocker: Scan keys re-derived in %.1f ms", millis))
         #endif
         return (tab, vaultFolder)
     }
 
-    /// The ring around the two keys: every twin for the Scan tab, every key
-    /// this phone holds for itself, then the two local keys, written last so
-    /// a local key always wins its own identifier, though a twin with that
-    /// identifier is the same bytes in any case. Called with `ringLock` held.
     private func rebuildRingLocked(tab: SymmetricKey, vaultFolder: SymmetricKey) {
         var fresh = KeyTwin.twins(for: .scan)
         for held in Self.heldKeys() {
@@ -117,9 +72,6 @@ final class EncryptedVaultStorage {
         ring = fresh
     }
 
-    /// Reads the ring back from the Keychain: every twin for the Scan tab,
-    /// every key this phone holds for itself, and the two local keys, read
-    /// back first when the cache is empty. Asked once and never waited on.
     func reloadRing() {
         ringLock.lock()
         defer { ringLock.unlock() }
@@ -130,10 +82,6 @@ final class EncryptedVaultStorage {
         rebuildRingLocked(tab: keys.tab, vaultFolder: keys.vaultFolder)
     }
 
-    /// Drops both keys and the ring built around them. Called at every lock
-    /// and every move to the background through `VaultStore.lockSession`.
-    /// The Keychain records are untouched and the keys re-derive on the
-    /// next access.
     func purgeKeys() {
         ringLock.lock()
         cachedKey = nil
@@ -142,8 +90,6 @@ final class EncryptedVaultStorage {
         ringLock.unlock()
     }
 
-    /// Both keys for one call, or a thrown refusal when the Keychain would
-    /// not hand them back.
     private func requireKeys() throws -> (tab: SymmetricKey, vaultFolder: SymmetricKey) {
         ringLock.lock()
         defer { ringLock.unlock() }
@@ -158,10 +104,6 @@ final class EncryptedVaultStorage {
         return ring
     }
 
-    /// The ring a blob from the cloud may open under: everything in the
-    /// ring but the Vault key. A Vault page never travels, so bytes
-    /// under that key arriving from the cloud are not this app's and
-    /// refuse before any folder is consulted.
     private func cloudRing() -> [Data: SymmetricKey] {
         ringLock.lock()
         defer { ringLock.unlock() }
@@ -171,35 +113,14 @@ final class EncryptedVaultStorage {
         return ring
     }
 
-    // MARK: Keys held for restored material
-    //
-    // A blob restored from another phone's copy sits on disk under that
-    // phone's tab key, which this phone has only as a twin, and a twin is
-    // an iCloud Keychain item any phone on the account can delete. So a
-    // restore first writes every twin it can read into this phone's own
-    // device-only keys, under one account, and the ring reads them back
-    // at every reload. They are raw tab keys, as the twins are; no Vault
-    // key ever comes this way.
-
     private static let heldAccount = "scanlocker.aes.held.v1"
 
-    /// What the held-key account answered: the keys it holds, nothing
-    /// stored, or an answer the reader cannot use.
-    ///
-    /// The three are kept apart because a writer has to tell them apart.
-    /// `unreadable` covers the Keychain refusing the item — which is what it
-    /// says during prewarming, a background launch and the moment after the
-    /// app resigns active — and a record that will not decode. Either way
-    /// keys may be stored that this read did not see, and a write built on
-    /// that read would drop them.
     enum HeldRead {
         case keys([SymmetricKey])
         case absent
         case unreadable
     }
 
-    /// Every key this phone holds for itself beyond its two local keys, as
-    /// the Keychain answered.
     private static func heldRead() -> HeldRead {
         let answer = KeychainGeneric.read(service: service, account: heldAccount)
         switch answer {
@@ -216,24 +137,11 @@ final class EncryptedVaultStorage {
         }
     }
 
-    /// The held keys for a reader building the ring. An answer it cannot use
-    /// reads as none, which closes the ring around the keys it does have: a
-    /// blob whose key is missing refuses to open and is kept.
     private static func heldKeys() -> [SymmetricKey] {
         if case .keys(let keys) = heldRead() { return keys }
         return []
     }
 
-    /// Writes every twin for the Scan tab into the held keys, read back
-    /// before it is trusted. True when every twin is held afterwards.
-    ///
-    /// The write carries the keys already held, so it begins by reading
-    /// them. An answer the reader cannot use ends it here: writing the twins
-    /// alone over an account whose contents were not seen would drop every
-    /// key this phone had written down for restored material, and the blobs
-    /// sealed under them would never open again. Refusing holds the restore
-    /// back, which the caller reports, and leaves every stored key where it
-    /// is until the Keychain answers.
     func holdTwinsLocally() -> Bool {
         let twins = KeyTwin.twins(for: .scan)
         guard twins.isEmpty == false else { return true }
@@ -260,46 +168,26 @@ final class EncryptedVaultStorage {
         return true
     }
 
-    /// The tab key's identifier, or nil while there is no key.
     var tabKeyID: Data? { (try? requireKeys()).map { SealedEnvelope.keyID(of: $0.tab) } }
 
-    /// Adds the synchronisable twin of the tab key. The local item is
-    /// untouched. The Vault key has no twin and never gains one.
     func publishTwin() -> Bool {
         guard let keys = try? requireKeys() else { return false }
         return KeyTwin.publish(keys.tab, tab: .scan)
     }
 
-    /// Removes the tab key's twin and nothing else.
     func withdrawTwin() -> Bool {
         guard let tabKeyID else { return false }
         return KeyTwin.withdraw(keyID: tabKeyID, tab: .scan)
     }
 
-    /// The service this store's keys were written under before they moved to
-    /// the bundle identifier. An install that reached that build left its
-    /// keys there, and a delete of the current service alone would leave
-    /// them on the iPhone after an erase that promised nothing is kept.
     private static let retiredService = "Zirkon.VaultScan"
 
-    /// Fresh-install wipe for this store's key, under the service it uses
-    /// and the one it used to use. Returns false when the Keychain refused,
-    /// so the caller retries on a later launch. A service holding nothing is
-    /// not a refusal.
     static func wipeKeyForFreshInstall() -> Bool {
         let current = KeychainGeneric.deleteService(service)
         let retired = KeychainGeneric.deleteService(retiredService)
         return current && retired
     }
 
-    /// Deletes every key this store owns, the Vault key's Enclave key and
-    /// the held keys with them, and drops them from memory under the lock
-    /// every reader takes, so no seal runs under a key stored nowhere. The
-    /// next access mints fresh keys as a new installation does. The
-    /// security log and the paired devices reach the whole app and are
-    /// sealed under the tab key, so both are read first and sealed again
-    /// under the fresh key. False when the Keychain kept the keys or either
-    /// file could not be written again.
     func wipeKeys() -> Bool {
         let audit = loadAuditIndex()
         let trusted = loadTrustedIndex()
@@ -319,17 +207,11 @@ final class EncryptedVaultStorage {
         return true
     }
 
-    /// Seals and opens one blob under each Scan key with a name as
-    /// authenticated data. Run at launch; a mismatch refuses the launch.
     func selfTest() -> Bool {
         guard let keys = try? requireKeys() else { return false }
         return SealedEnvelope.selfTest(keys: [keys.tab, keys.vaultFolder])
     }
 
-    // MARK: Photos (JPEG in, encrypted file out)
-
-    /// Encrypts a JPEG and writes it. Returns the on-disk filename.
-    /// `inVaultFolder` chooses the key, from the folder the page is filed in.
     func savePhoto(_ jpeg: Data, id: UUID, inVaultFolder: Bool) throws -> String {
         let filename = id.uuidString + ".enc"
         let sealed = try seal(jpeg, name: filename, key: try keyFor(inVaultFolder: inVaultFolder))
@@ -339,30 +221,21 @@ final class EncryptedVaultStorage {
         return filename
     }
 
-    /// A page's JPEG size in bytes: the sealed file's length less the
-    /// envelope's header, nonce and tag, so the page is never opened.
     func pageJPEGByteCount(filename: String) -> Int {
         let url = photosDir.appendingPathComponent(filename)
         let sealed = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
         return max(0, sealed - SealedEnvelope.headerLength - 12 - 16)
     }
 
-    /// Whether a page already occupies this identifier's filename. The
-    /// catalog is not the answer: a picture waiting in the trash is out of
-    /// the live list and its sealed file is still on disk under its own
-    /// name, so only the disk can say.
     func pageFileExists(id: UUID) -> Bool {
         let url = photosDir.appendingPathComponent(id.uuidString + ".enc")
         return FileManager.default.fileExists(atPath: url.path)
     }
 
-    /// Whether the vault's volume lacks the room to seal one more picture,
-    /// read when a save has failed so the report can name a full disk.
     var isShortOfRoom: Bool {
         (try? VaultRoom.require(VaultRoom.probeBytes, in: photosDir)) == nil
     }
 
-    /// Removes a page's sealed file and the sealed thumbnail beside it.
     func deletePhoto(filename: String) {
         let url = photosDir.appendingPathComponent(filename)
         try? FileManager.default.removeItem(at: url)
@@ -370,12 +243,6 @@ final class EncryptedVaultStorage {
         try? FileManager.default.removeItem(at: thumb)
     }
 
-    /// The same removal for a list of pages, on a background queue, for a
-    /// caller whose catalog write has already landed. It reads `photosDir`,
-    /// which never changes, and the file system, so it holds no main-only
-    /// state. Nothing waits on it: a page the catalog no longer names is
-    /// sealed bytes nothing can reach, and one whose removal is lost to a
-    /// kill is destroyed by `sweepOrphanPhotos` at the next launch.
     func deletePhotosInBackground(filenames: [String]) {
         guard filenames.isEmpty == false else { return }
         DispatchQueue.global(qos: .utility).async { [self] in
@@ -383,20 +250,11 @@ final class EncryptedVaultStorage {
         }
     }
 
-    /// What sealing one picture produced: the file it lives in and the
-    /// row-sized copy the list draws, already decoded, so the caller can put
-    /// it straight into the thumbnail cache without decrypting anything back.
     struct SealedPicture {
         let filename: String
         let thumbnail: UIImage?
     }
 
-    /// Encodes, seals, and writes one picture, then seals a row-sized copy
-    /// beside it. The picture is cut to the stored size first, and the
-    /// row-sized copy is shrunk from that same bitmap, which is already in
-    /// hand, so the JPEG just written is not decoded again. The thumbnail
-    /// is a cache: if it cannot be written the picture is still saved, and
-    /// the list heals the thumbnail the first time it draws the row.
     func savePhotoResult(_ image: UIImage, id: UUID, inVaultFolder: Bool) -> Result<SealedPicture, VaultFailure> {
         let prepared = ScanImage.prepared(image, maxSide: ScanImage.decodeCeiling)
         guard let jpeg = prepared.jpegData(compressionQuality: 0.85) else {
@@ -415,25 +273,8 @@ final class EncryptedVaultStorage {
         }
     }
 
-    // MARK: Thumbnails (sealed beside each page)
-    //
-    // The list used to decode the full 2400-pixel JPEG of every row it drew
-    // and shrink it on the spot, seven times the work of decoding a picture
-    // that is already row-sized, and it did so again every time the cache
-    // let the row go. The row-sized copy is now sealed once, next to the
-    // page, under the same key and the same file protection. A page written
-    // before this existed has no thumbnail file; the first row that asks for
-    // it decodes the full picture once and writes the thumbnail then, so an
-    // existing vault heals itself as it is scrolled, with no migration step.
-
-    /// `t-{uuid}.enc`, derived from the page's own filename so the catalog
-    /// does not have to know thumbnails exist.
     static func thumbnailFilename(for filename: String) -> String { "t-" + filename }
 
-    /// Decodes the JPEG straight to row size and seals it under the key
-    /// that seals its page, read off the page file's own header. Returns
-    /// the decoded copy so the caller can cache it, or nil when anything
-    /// failed. Never throws and never reports: a thumbnail is a cache.
     @discardableResult
     func saveThumbnail(fromJPEG jpeg: Data, for filename: String) -> UIImage? {
         guard let key = keySealing(page: filename) else { return nil }
@@ -446,31 +287,17 @@ final class EncryptedVaultStorage {
         return saveThumbnail(small, for: filename, key: key) ? small : nil
     }
 
-    /// The same row-sized copy taken from the page bitmap the save already
-    /// holds. A save has the picture decoded in front of it, so shrinking
-    /// that costs one draw where reading the JPEG back costs a decode.
     @discardableResult
     private func saveThumbnail(from page: UIImage, for filename: String, key: SymmetricKey) -> UIImage? {
         let small = ScanImage.opaque(page, maxSide: ScanImage.thumbnailMaxSide)
         return saveThumbnail(small, for: filename, key: key) ? small : nil
     }
 
-    /// The key a page on disk was sealed under, read from its header, or
-    /// nil when the file is absent, unreadable or under a key this phone
-    /// does not hold. Five bytes are read and the page is not opened.
     private func keySealing(page filename: String) -> SymmetricKey? {
         guard let id = pageKeyID(at: photosDir.appendingPathComponent(filename)) else { return nil }
         return currentRing()[id]
     }
 
-    /// Which key a picture's pages were sealed under, read from the headers
-    /// alone. Nil where no page could be read, which is the answer that
-    /// leaves a picture where it stands rather than placing it on a guess.
-    ///
-    /// True as soon as one page names the Vault key. A picture whose pages
-    /// disagree is a picture the app never wrote, and a sealed Vault page
-    /// filed anywhere but Vault would hand its bytes to every gate as
-    /// ordinary, so the Vault answer is the one a mistake lands on.
     func sealedInVaultFolder(pages filenames: [String]) -> Bool? {
         guard let vaultFolderID = (try? requireKeys().vaultFolder).map({ SealedEnvelope.keyID(of: $0) })
         else { return nil }
@@ -483,7 +310,6 @@ final class EncryptedVaultStorage {
         return read ? false : nil
     }
 
-    /// The key identifier in a sealed file's header. Five bytes are read.
     private func pageKeyID(at url: URL) -> Data? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
@@ -506,9 +332,6 @@ final class EncryptedVaultStorage {
         }
     }
 
-    /// The sealed row-sized copy, decoded and ready to draw, or nil when
-    /// there is none yet or it would not open. Nothing is reported either
-    /// way: the page itself is the record, and the caller falls back to it.
     func loadThumbnail(filename: String) -> UIImage? {
         let name = Self.thumbnailFilename(for: filename)
         let url = photosDir.appendingPathComponent(name)
@@ -516,53 +339,24 @@ final class EncryptedVaultStorage {
         return ScanImage.decoded(jpeg, maxSide: ScanImage.thumbnailMaxSide)
     }
 
-    /// The page as a decoded picture. Decoding is left to the caller's use
-    /// of the image: `UIImage(data:)` holds the compressed bytes and decodes
-    /// when first drawn, which is what a viewer wants.
     func loadPhoto(filename: String) -> Result<UIImage, VaultFailure> {
         switch loadPhotoJPEG(filename: filename) {
         case .failure(let failure):
             return .failure(failure)
         case .success(let jpeg):
             guard let image = UIImage(data: jpeg) else {
-                // AES-GCM opened these bytes, which is positive proof they
-                // are exactly what this app sealed. A decode that fails after
-                // that is ImageIO refusing the work — under memory pressure,
-                // for instance — and calling it tampering contradicts the
-                // authentication that just succeeded.
                 return .failure(.decryptFailed)
             }
             return .success(image)
         }
     }
 
-    /// The page's JPEG bytes, opened. Every reader of a page goes through
-    /// here: the viewer, the thumbnail heal, the PDF writer and the share
-    /// outbox, so the one place that judges a failed read is this one.
     func loadPhotoJPEG(filename: String) -> Result<Data, VaultFailure> {
         let url = photosDir.appendingPathComponent(filename)
         guard let raw = try? Data(contentsOf: url) else {
-            // The read failed for one of two reasons, and only one of them is
-            // tampering. The file may be gone, which is the case the audit
-            // exists to catch. Or the file is there and iOS will not hand the
-            // bytes over, because every picture is written with complete file
-            // protection and is unreadable while the iPhone is locked — a
-            // thumbnail still loading when the screen locks hits exactly that.
-            // Existence is metadata and answers either way, so it separates
-            // them. Counting the second as tampering put a standing FAIL on
-            // the Security page for something that never happened.
             if FileManager.default.fileExists(atPath: url.path) {
                 return .failure(.keychainWriteFailed)
             }
-            // A file that is not here is not evidence of tampering, and it
-            // used to be counted as if it were. The loader never cancels, so
-            // a thumbnail decrypt already in flight when the user deletes a
-            // picture — or re-saves one, which writes new files under new
-            // names and removes the old — arrives to find the file gone. The
-            // catalog has already stopped listing that name, so the failure
-            // could not even be attributed, and the Security page showed a
-            // standing accusation with nothing under it. The app's own
-            // housekeeping is not a security event.
             return .failure(.missingFile)
         }
         do {
@@ -570,41 +364,14 @@ final class EncryptedVaultStorage {
             VaultIntegrity.noteMemoryDecrypt()
             return .success(jpeg)
         } catch StorageError.keyUnavailable {
-            // The Keychain would not hand the key over — a locked device, not
-            // tampering. Nothing is shown and nothing is counted: counting it
-            // put a FAIL on the Security page for an event that never happened.
             SafeMode.reportAtUse(.keyStorage)
             return .failure(.keychainWriteFailed)
         } catch {
-            // AES-GCM refused the bytes. This used to fall into an adoption
-            // branch that took any file which happened to parse as an image,
-            // re-encrypted it, and reported a normal decrypt — so a plaintext
-            // JPEG dropped into the app's container by anything that can write
-            // there was laundered into the vault as if it were legitimate,
-            // while the Security page's own explanation promised the opposite
-            // ("AES-256-GCM refuses tampered data rather than showing it").
-            // The app has never shipped a build that wrote plaintext photos,
-            // so there is no legacy content for that branch to rescue; it was
-            // pure attack surface, and it is gone. The promise is now true.
-            //
-            // This is the one branch that still reports. Authenticated
-            // encryption does not refuse ciphertext it produced, so bytes
-            // that are present and will not open are bytes that changed
-            // after this app wrote them, or sit under a name they were not
-            // sealed under, or carry a format byte this build does not
-            // know. All three are reported the same way, and the file is
-            // left exactly as it was. Reporting is all this does: whether
-            // that counts is decided by the Modified operating system check,
-            // which knows whether the catalog still lists this file and can
-            // therefore name what failed. Counting here, where the filename
-            // is known and the catalog is not, is what produced a red row
-            // the page could not explain.
             VaultIntegrity.noteSealRefused(subject: filename)
             return .failure(.decryptFailed)
         }
     }
 
-    /// The stored size of a picture's file, read without opening it.
     func sealedPhotoSize(filename: String) -> Int {
         let path = photosDir.appendingPathComponent(filename).path
         return (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? 0
@@ -615,41 +382,19 @@ final class EncryptedVaultStorage {
         return try? Data(contentsOf: url)
     }
 
-    // MARK: The iCloud copy's reads and writes
-    //
-    // The copy carries a page's sealed bytes exactly as they sit on disk
-    // and never opens them on the way up. On the way down each blob is
-    // opened under the key its own header names, with its file name as
-    // authenticated data, which is what proves the bytes are whole and
-    // belong under that name, and is then written to disk byte for byte.
-    // Only a blob that must take another name is resealed, under the same
-    // key.
-
-    /// Seals bytes under the tab key for the copy, bound to `name`. The
-    /// cloud catalog goes up through here. Never the Vault key.
     func sealForCloud(_ plaintext: Data, name: String) throws -> Data {
         try seal(plaintext, name: name, key: try requireKey())
     }
 
-    /// Opens bytes that came down from the copy under whichever key in the
-    /// cloud ring their header names, which never includes the Vault key.
-    /// This is the verification every restored blob passes before it is
-    /// written.
     func openFromCloud(_ sealed: Data, name: String) throws -> Data {
         _ = try requireKey()
         return try SealedEnvelope.open(sealed, ring: cloudRing(), name: name)
     }
 
-    /// Whether the cloud ring holds the key a blob's header names, without
-    /// opening it.
     func cloudRingHolds(keyID: Data) -> Bool {
         cloudRing()[keyID] != nil
     }
 
-    /// Copies a page's sealed file to `destination`, file to file and off
-    /// this process's memory, under the attributes given, and answers with
-    /// the key identifier off its header and its size. The outbox for an
-    /// upload is filled through here. A page that is not on disk throws.
     func copySealedPage(filename: String, to destination: URL,
                         attributes: [FileAttributeKey: Any]) throws -> (keyID: Data, size: Int) {
         let source = photosDir.appendingPathComponent(filename)
@@ -662,9 +407,6 @@ final class EncryptedVaultStorage {
         return (keyID, size)
     }
 
-    /// Writes a page's sealed bytes to disk exactly as given, under its
-    /// final name. Refuses a name already on disk: a restore never replaces
-    /// a file, and a taken name is the caller's cue to mint another.
     func storeSealedPage(_ sealed: Data, filename: String) throws {
         let url = photosDir.appendingPathComponent(filename)
         guard FileManager.default.fileExists(atPath: url.path) == false else {
@@ -674,9 +416,6 @@ final class EncryptedVaultStorage {
         applyExclusion(url, true)
     }
 
-    /// Opens a blob sealed under `oldName` and seals it again under the same
-    /// key and `newName`, for the one case where a restored page must take
-    /// a fresh identifier. The file on disk is written by `storeSealedPage`.
     func resealForNewName(_ sealed: Data, from oldName: String, to newName: String) throws -> Data {
         guard let id = SealedEnvelope.keyID(in: sealed), let key = currentRing()[id] else {
             throw StorageError.keyUnavailable
@@ -685,20 +424,10 @@ final class EncryptedVaultStorage {
         return try SealedEnvelope.seal(plain, key: key, name: newName)
     }
 
-    /// Whether a page's sealed file is on disk. Metadata only, so it answers
-    /// while the device is locked and costs nothing for a large page.
     func pageFileExists(filename: String) -> Bool {
         FileManager.default.fileExists(atPath: photosDir.appendingPathComponent(filename).path)
     }
 
-    /// Every Scan key a page on this phone may be sealed under, each
-    /// wrapped under a key only one trusted device can derive and named by
-    /// its identifier in hex, so a paired device opens every page the
-    /// envelope carries under the key the page's own header names: the tab
-    /// key, every key held for restored material and every twin. The
-    /// Vault key goes only when a Vault page travels, which is the one
-    /// place it leaves the Keychain in any form, sealed to one paired device
-    /// over the local link and never the internet.
     func wrappedKeys(under wrapping: SymmetricKey, includingVaultFolder: Bool) throws -> [String: Data] {
         let local = try requireKeys()
         var keys = cloudRing()
@@ -724,16 +453,9 @@ final class EncryptedVaultStorage {
         return SymmetricKey(data: raw)
     }
 
-    /// Seals bytes under the tab key for the transfer envelope, bound to
-    /// `name`, in the shape every stored blob takes, so the receiver opens
-    /// them under the ring the envelope carries with the item's identifier
-    /// as the name. A Locker payload travels this way; it is opened and
-    /// resealed on arrival and never stored as it travelled.
     func sealForWire(_ data: Data, name: String) throws -> Data {
         try seal(data, name: name, key: try requireKey())
     }
-
-    // MARK: Index (folder + photo records)
 
     func saveIndex(_ plaintext: Data) throws {
         let sealed = try seal(plaintext, name: metaURL.lastPathComponent)
@@ -741,10 +463,6 @@ final class EncryptedVaultStorage {
         applyExclusion(metaURL, true)
     }
 
-    /// What a catalog read actually found. `absent` and `unreadable` used to be
-    /// the same `nil`, which meant a file that would not decrypt produced an
-    /// empty catalog that the next write then saved over the good one. They are
-    /// separated here so the store can refuse to write instead.
     enum CatalogRead {
         case absent
         case loaded(Data)
@@ -752,15 +470,6 @@ final class EncryptedVaultStorage {
     }
 
     func loadIndex() -> CatalogRead {
-        // The catalog is ciphertext or it is nothing. Two legacy branches used
-        // to live here — one adopted a vault.enc that was plaintext JSON, one
-        // read a plaintext vault.json from an era before encryption — and both
-        // meant an attacker able to write into the container could hand this
-        // app a catalog of their own composition and have it re-encrypted and
-        // trusted. No shipped build ever wrote either form, so no user's data
-        // ever needed them. A file that will not decrypt is unreadable, full
-        // stop, and the store already refuses to write over anything
-        // unreadable.
         guard FileManager.default.fileExists(atPath: metaURL.path) else { return .absent }
         guard let raw = try? Data(contentsOf: metaURL) else { return .unreadable }
         guard let plain = try? open(raw, name: metaURL.lastPathComponent) else {
@@ -770,14 +479,6 @@ final class EncryptedVaultStorage {
         return .loaded(plain)
     }
 
-    // MARK: AES-GCM
-    //
-    // Every stored blob goes through these, in the shape SealedEnvelope
-    // defines, bound to the name it is stored under. A catalog, a record
-    // and a manifest seal under the tab key; a page seals under the key
-    // its folder calls for; and every blob opens under whichever key its
-    // own header names, out of the ring.
-
     private func seal(_ plaintext: Data, name: String) throws -> Data {
         try seal(plaintext, name: name, key: try requireKey())
     }
@@ -786,11 +487,6 @@ final class EncryptedVaultStorage {
         try SealedEnvelope.seal(plaintext, key: key, name: name)
     }
 
-    /// Takes `ringLock` once for the two questions an open asks — whether the
-    /// keys are there, and what the ring holds — where two calls took it
-    /// twice and re-derived the keys twice. The refusal and the ring are
-    /// exactly what those two calls answered. The decrypt itself still runs
-    /// with the lock released, so a purge is never held behind one.
     private func open(_ sealed: Data, name: String) throws -> Data {
         ringLock.lock()
         let held = loadedKeysLocked() != nil
@@ -804,21 +500,14 @@ final class EncryptedVaultStorage {
         try requireKeys().tab
     }
 
-    /// The key a page is sealed under, from the folder it is filed in.
     private func keyFor(inVaultFolder: Bool) throws -> SymmetricKey {
         let keys = try requireKeys()
         return inVaultFolder ? keys.vaultFolder : keys.tab
     }
 
-    // MARK: Keychain (256-bit keys, this device only)
-
     private static let service = Bundle.main.bundleIdentifier ?? "Zirkon.ScanLocker"
     private static let account = "scanlocker.aes.v1"
 
-    /// The Vault key's slot. Enclave-wrapped through the one wrap the
-    /// Locker's keys use, in its own slot with its own Enclave key, in this
-    /// store's service, so the fresh-install wipe of this service takes
-    /// both Scan keys together.
     static let vaultFolderSlot = EnclaveKeyWrap.Slot(
         service: service,
         wrappedAccount: "scanlocker.aes.staybox.wrapped.v1",
@@ -827,9 +516,6 @@ final class EncryptedVaultStorage {
         label: "scanlocker.scan.staybox.wrap.v1"
     )
 
-    /// The Vault key, read back or minted, under the same fail-closed
-    /// rules as the tab key: nothing is minted over a record that exists
-    /// and will not open, or while the Keychain will not answer.
     private static func loadOrCreateVaultFolderKey() -> SymmetricKey? {
         do {
             return try EnclaveKeyWrap.loadOrCreate(in: vaultFolderSlot).key
@@ -839,18 +525,6 @@ final class EncryptedVaultStorage {
         }
     }
 
-    /// Keychain is the only source of truth. Never returns a key that is only in RAM.
-    ///
-    /// A key is minted only when the Keychain says, explicitly, that nothing is
-    /// stored. Every other answer — including the one a locked device gives
-    /// during app prewarming or a background launch — leaves the existing key
-    /// alone and reports no key, which is recoverable. Writing over it is not.
-    ///
-    /// A phone with no local tab key, which is a new phone or a reinstall,
-    /// adopts a twin when the Keychain holds one for this tab, by writing a
-    /// local item with the same bytes, and mints a key only when it holds
-    /// none. The twin is asked for once; a twin still on its way is met at
-    /// the next launch, when it joins the ring beside the minted key.
     private static func loadOrCreateKey() -> SymmetricKey? {
         switch readKey() {
         case .found(let data):
@@ -874,9 +548,6 @@ final class EncryptedVaultStorage {
         return stored
     }
 
-    /// The tab key as the Keychain answers for it. `KeychainGeneric` keeps
-    /// "nothing stored" and "will not answer yet" apart, which is what lets
-    /// this mint only when there is genuinely nothing.
     private static func readKey() -> KeychainGeneric.Read {
         KeychainGeneric.read(service: service, account: account)
     }
@@ -886,9 +557,6 @@ final class EncryptedVaultStorage {
         return SymmetricKey(data: data)
     }
 
-    /// Adds the tab key. A duplicate means a key appeared between the read
-    /// and the add, and that key stands: this answers whether one is there
-    /// and never writes over it.
     @discardableResult
     private static func saveKey(_ key: SymmetricKey) -> Bool {
         let data = key.withUnsafeBytes { Data($0) }
@@ -904,29 +572,14 @@ final class EncryptedVaultStorage {
         KeychainGeneric.delete(service: service, account: account)
     }
 
-    /// What the do-not-back-up flag actually reads back as, and on how many
-    /// paths it could be read at all.
-    ///
-    /// The count matters. The old test returned true unless it found a path
-    /// that was explicitly not excluded, so a path whose resource values
-    /// would not read was skipped exactly like a path that does not exist
-    /// yet — and a filesystem that answered nothing produced a confident
-    /// PASS. Nothing verified is not the same as nothing wrong.
     struct BackupExclusion {
-        /// Paths that exist and answered.
         let read: Int
-        /// Of those, how many carry the flag.
         let excluded: Int
 
-        /// Every path that answered carries the flag, and at least one did.
         var verified: Bool { read > 0 && read == excluded }
     }
 
     func backupExclusion() -> BackupExclusion {
-        // The share outbox exists only while a PDF is being shared, and
-        // counts only then; a path that does not exist is skipped below.
-        // The cloud outbox holds ciphertext copies while an upload runs and
-        // counts only then, the same as the share outbox.
         let urls = [rootURL, photosDir, metaURL, lockerURL, Self.trustedIndexURL,
                     Self.auditIndexURL,
                     ShareOutbox.directoryURL, CloudOutbox.directoryURL]
@@ -942,28 +595,17 @@ final class EncryptedVaultStorage {
         return BackupExclusion(read: read, excluded: excluded)
     }
 
-    /// True when ScanLocker’s store is marked do-not-back-up on this iPhone
-    /// and that could actually be confirmed.
     func backupIsExcluded() -> Bool { backupExclusion().verified }
 
-    // MARK: The Vault key check
-
-    /// How many Vault pages opened under the Vault key and how many refused.
     struct VaultKeyReport {
         var opened = 0
         var refused = 0
-        /// False when the Vault key would not load.
         var keyLoaded = true
-        /// False when the deadline fired before the last page.
         var finished = true
 
         var verified: Bool { keyLoaded && finished && refused == 0 }
     }
 
-    /// Opens each named page under the Vault key alone and counts the
-    /// answers. A page's plaintext is released before the next page is read,
-    /// and nothing is written. A page with no file is left to the integrity
-    /// audit and counts as neither.
     func vaultKeyReport(filenames: [String], deadline: Date) -> VaultKeyReport {
         var report = VaultKeyReport()
         guard let key = try? requireKeys().vaultFolder else {
@@ -986,34 +628,18 @@ final class EncryptedVaultStorage {
         return report
     }
 
-    // MARK: The Locker's catalog
-    //
-    // Its bytes live here with the rest, and the key that seals them is the
-    // Locker's own, which `LockerSeal` holds and this file never sees. The
-    // catalog names every item, its folder and its title, so a key that
-    // opens it is a key that names what the Locker holds; leaving it under
-    // the Scan tab key would have let the Scan copy's twin in iCloud
-    // Keychain name them from a copy of this phone's files. The caller seals
-    // and opens; this writes and reads.
-
-    /// Writes the Locker's catalog, already sealed by `LockerSeal`.
     func writeLockerIndex(_ sealed: Data) throws {
         try VaultRoom.write(sealed, to: lockerURL)
         applyExclusion(lockerURL, true)
     }
 
-    /// The Locker's catalog as it sits on disk, still sealed.
     func readLockerIndex() -> CatalogRead {
         guard FileManager.default.fileExists(atPath: lockerURL.path) else { return .absent }
         guard let raw = try? Data(contentsOf: lockerURL) else { return .unreadable }
         return .loaded(raw)
     }
 
-    /// The name the Locker's catalog is sealed under, which is its file
-    /// name, the way every other blob is bound to the name it sits under.
     static var lockerIndexName: String { lockerIndexURL.lastPathComponent }
-
-    // MARK: Security event log
 
     func saveAuditIndex(_ plaintext: Data) throws {
         let url = Self.auditIndexURL
@@ -1033,8 +659,6 @@ final class EncryptedVaultStorage {
         return .loaded(plain)
     }
 
-    // MARK: Trusted devices
-
     func saveTrustedIndex(_ plaintext: Data) throws {
         let url = Self.trustedIndexURL
         let sealed = try seal(plaintext, name: url.lastPathComponent)
@@ -1042,8 +666,6 @@ final class EncryptedVaultStorage {
         applyExclusion(url, true)
     }
 
-    /// Removes `trusted.enc`. The one recovery from records that exist and
-    /// will not open; the owner asks for it and confirms it.
     func removeTrustedIndex() {
         try? FileManager.default.removeItem(at: Self.trustedIndexURL)
     }
@@ -1059,72 +681,31 @@ final class EncryptedVaultStorage {
         return .loaded(plain)
     }
 
-    /// Deletes sealed photo files the catalog does not name. Unreferenced
-    /// files are unreachable by construction — no screen can list, open, or
-    /// export them — and until this sweep existed they accumulated for the
-    /// life of the install: interrupted saves, failed imports, and edits cut
-    /// short each left one behind. Callers gate this on a catalog that
-    /// loaded cleanly; sweeping against a suspect catalog would destroy
-    /// content the next launch might still recover.
     func sweepOrphanPhotos(keeping referenced: Set<String>) {
-        // With no catalog file on disk there is nothing to have named these
-        // pages, so every one of them would read as unreferenced and go. A
-        // restore that stored its pages and was killed before the first
-        // catalog write leaves exactly that state, and so does a first save
-        // whose catalog write was refused for want of space.
         guard FileManager.default.fileExists(atPath: Self.vaultIndexURL.path) else { return }
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: photosDir, includingPropertiesForKeys: nil
         ) else { return }
-        // A thumbnail is kept exactly when its page is.
         var keep = referenced
         for name in referenced { keep.insert(Self.thumbnailFilename(for: name)) }
         for url in files where keep.contains(url.lastPathComponent) == false {
-            // Only the two names this sweep is about. A page is written as
-            // {uuid}.enc and its thumbnail as t-{uuid}.enc, so anything else
-            // in here belongs to something this reader does not know, and a
-            // reader that does not know a file does not get to delete it.
-            // Without this the sweep removed every unfamiliar name, so a
-            // file a later version of the app writes beside the pages, and a
-            // page named under a shape this one has not met, went on the
-            // first launch that ran it.
             guard Self.isSweepablePhotoFile(url.lastPathComponent) else { continue }
             try? FileManager.default.removeItem(at: url)
         }
     }
 
-    /// One sealed page on disk that no catalog names, placed by the key its
-    /// header was written under.
     struct StrandedPage {
         let filename: String
-        /// True where the header names this phone's Vault key. Vault has no
-        /// copy anywhere, so its pages have nowhere else to come back from.
         let inVaultFolder: Bool
-        /// When the file was written, which is when the picture was saved.
         let createdAt: Date
     }
 
-    /// What the listing found, and what it could not reach.
     struct StrandedSweep {
         let pages: [StrandedPage]
-        /// Pages whose key this phone does not hold, and every page still
-        /// standing when the deadline fired. Each is left on disk untouched.
         let unreached: Int
         let deadlineFired: Bool
     }
 
-    /// Every page file this phone still holds a key for, read from the
-    /// header alone.
-    ///
-    /// Five bytes of each file are read and nothing is opened, so a large
-    /// directory costs a stat and a short read per page. A page under a key
-    /// the ring does not hold is counted and left where it is, because a
-    /// file this app cannot open is kept and never destroyed. Thumbnails are
-    /// skipped: each one is filed with the page it belongs to.
-    ///
-    /// The walk stops at the deadline and reports what it has, so a start
-    /// over on a damaged directory answers in bounded time and the pages it
-    /// did not reach stay on disk for the next run.
     func strandedPages(until deadline: Date) -> StrandedSweep {
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: photosDir, includingPropertiesForKeys: [.contentModificationDateKey]
@@ -1151,26 +732,12 @@ final class EncryptedVaultStorage {
         return StrandedSweep(pages: found, unreached: unreached, deadlineFired: fired)
     }
 
-    /// True for the two file names the photo sweep owns: a sealed page and
-    /// its thumbnail. Every other name is left where it is.
     static func isSweepablePhotoFile(_ name: String) -> Bool {
         guard name.hasSuffix(".enc") else { return false }
         var stem = String(name.dropLast(4))
         if stem.hasPrefix("t-") { stem = String(stem.dropFirst(2)) }
         return UUID(uuidString: stem) != nil
     }
-
-    // MARK: Staging manifests
-    //
-    // A multi-page capture seals each page the moment it is kept and enters
-    // the catalog once, at Done. Between the first Keep and Done the pages
-    // exist only as sealed files nothing lists, and a process ended in that
-    // window — a memory kill, a crash, a forced quit — used to lose the whole
-    // document, because until this the pages were bitmaps in RAM and the
-    // sweep above reclaims files the catalog does not name. The manifest is
-    // the small sealed record of which files belong to a batch still in
-    // progress, rewritten as each page lands and removed when the batch
-    // commits or is discarded, so the next launch can finish the commit.
 
     static let stagingPrefix = "staging-"
 
@@ -1189,11 +756,6 @@ final class EncryptedVaultStorage {
         try? FileManager.default.removeItem(at: stagingURL(id))
     }
 
-    /// Every manifest on disk that opens, by identifier. One that will not
-    /// open is skipped and left where it is, on the rule that a sealed blob
-    /// which refuses is never deleted or rewritten by the reader that
-    /// refused it. Its pages are unlisted files, which the sweep reclaims,
-    /// and that is the same outcome as before manifests existed.
     func loadStagingManifests() -> [(id: UUID, plaintext: Data)] {
         guard let files = try? FileManager.default.contentsOfDirectory(
             at: rootURL, includingPropertiesForKeys: nil
@@ -1213,15 +775,6 @@ final class EncryptedVaultStorage {
         return found
     }
 
-    /// Always excluded from device backup. There is no user toggle.
-    ///
-    /// This marks the container, the pictures folder and both catalogs,
-    /// which is what the Security check reads back. Every page and thumbnail
-    /// is marked as it is written, and the folder's flag covers everything
-    /// inside it, so the walk over every file below is belt and braces. The
-    /// walk runs on a background queue, since at 61 microseconds a file it
-    /// would hold a vault of ten thousand pages for more than a second before
-    /// the first frame.
     func excludeFromBackup() {
         applyExclusion(rootURL, true)
         applyExclusion(photosDir, true)
@@ -1231,10 +784,6 @@ final class EncryptedVaultStorage {
         applyExclusion(Self.auditIndexURL, true)
     }
 
-    /// The walk over every sealed page and thumbnail, on a background queue.
-    /// Bounded by the number of files. A file that vanishes between the
-    /// listing and its turn is skipped by the existence check, and a file
-    /// written meanwhile was flagged by the write that made it.
     func excludePhotoFilesFromBackupInBackground() {
         let photosDir = self.photosDir
         DispatchQueue.global(qos: .utility).async { [self] in
@@ -1256,7 +805,6 @@ final class EncryptedVaultStorage {
     enum StorageError: Error {
         case sealFailed
         case keyUnavailable
-        /// A restore asked to write under a name already on disk.
         case nameTaken
     }
 }

@@ -1,18 +1,8 @@
-//
-//  TrustedPairingMarks.swift
-//  ScanLocker
-//
-//  What the pairing screens draw around their words: the PIN the host shows,
-//  the search the other side runs, and the steps under it.
-//
-
 import SwiftUI
 
-/// The PIN the host reads out, large and centred on the sheet.
 struct TrustedPINDigits: View {
     let pin: String
 
-    /// Two groups of three, the way a system verification code is set.
     private var grouped: String {
         let half = pin.count / 2
         return pin.prefix(half) + " " + pin.dropFirst(half)
@@ -28,10 +18,6 @@ struct TrustedPINDigits: View {
     }
 }
 
-
-/// The search, drawn still: one device inside three grounds, each fainter than
-/// the one within it. Nothing here moves, because the row beneath says what is
-/// happening in words and carries the mark that turns.
 struct PairingSearchMark: View {
     var body: some View {
         ZStack {
@@ -53,9 +39,6 @@ struct PairingSearchMark: View {
     }
 }
 
-/// What the app is doing now, over the things the owner does. The first row
-/// carries the system's own indeterminate mark and the rest an open ring,
-/// which no selector in this app uses, so none of them reads as a box to tick.
 struct PairingStepList: View {
     let working: String
     let steps: [String]
@@ -99,8 +82,6 @@ struct PairingStepList: View {
 }
 
 extension PairingRadio {
-    /// The two radios as tiles, each keeping the blue it is known by, drawn
-    /// once for every popover that asks.
     static func tiles(current: PairingRadio? = nil,
                       onPick: @escaping (PairingRadio) -> Void) -> (DiscChoice, DiscChoice) {
         (DiscChoice(symbol: "wifi", name: PairingRadio.wiFi.name,
@@ -114,9 +95,6 @@ extension PairingRadio {
          })
     }
 
-    /// The remote route as the third tile, its globe in the wordmark blue. It
-    /// is dead while safe mode has the route off. A caller passes a line when the tile
-    /// has something to say.
     @MainActor
     static func remoteTile(enabled: Bool, line: String = "", current: Bool = false,
                            onPick: @escaping (PairingRadio) -> Void) -> DiscChoice {
@@ -127,9 +105,6 @@ extension PairingRadio {
 }
 
 extension TrustedDevicePairingLink.Role {
-    /// Share My PIN and Enter PIN as tiles the size of the radio tiles, so the
-    /// popover's two steps stand at one size with buttons of one size. The
-    /// remote route pairs under a code, so its tiles say Code.
     static func tiles(for radio: PairingRadio,
                       onPick: @escaping (TrustedDevicePairingLink.Role) -> Void)
         -> (DiscChoice, DiscChoice) {
@@ -139,16 +114,9 @@ extension TrustedDevicePairingLink.Role {
     }
 }
 
-/// The frame a pairing popover's step stands in: its title, a line under it, a
-/// way back where a step stands behind it, and its tiles. The title row holds
-/// the back button's height and the line holds its row on every step, blank
-/// where a step has nothing to say, so the tiles start at one height on every
-/// step.
 private struct PairingPopoverStep: View {
     let title: String
     var line: String? = nil
-    /// Why the radio picked last time would not start, said in red where the
-    /// line stands, so the other radio is the next tap.
     var problem: String? = nil
     var onBack: (() -> Void)? = nil
     let first: DiscChoice
@@ -156,11 +124,8 @@ private struct PairingPopoverStep: View {
     var third: DiscChoice? = nil
     var fourth: DiscChoice? = nil
 
-    /// What the radio step says under its title. It holds for both radios,
-    /// where naming a shared network would hold for Wi-Fi alone.
     static let radioLine = "Both devices must pick the same one."
 
-    /// Three tiles stand one above another, each with its disc beside its name.
     private static func stacked(_ tile: DiscChoice) -> DiscChoice {
         var tile = tile
         tile.stacked = true
@@ -179,7 +144,6 @@ private struct PairingPopoverStep: View {
                 }
             }
             .frame(minHeight: PageExitButton.side)
-            // A space keeps the row's height on a step with no line.
             Text(problem ?? line ?? " ")
                 .font(VaultTheme.body(12))
                 .foregroundColor(problem == nil ? VaultTheme.settingsSubtle : VaultTheme.secureNo)
@@ -206,16 +170,10 @@ private struct PairingPopoverStep: View {
     }
 }
 
-/// Select Connection Method as a popover: the title over the three route
-/// tiles. A tap outside closes it and keeps nothing, so it carries no Cancel of
-/// its own.
 struct PairingRadioPopover: View {
     var problem: String? = nil
-    /// Whether the Internet tile is live for what this popover leads to.
     var remote: Bool = true
     var remoteLine: String = ""
-    /// The radio this device was last sent on, ticked so the owner sees what
-    /// they picked last. Every tile stays one tap away.
     var current: PairingRadio? = nil
     let onPick: (PairingRadio) -> Void
 
@@ -229,13 +187,9 @@ struct PairingRadioPopover: View {
     }
 }
 
-/// The popover a paired device's row opens: the three routes a receive from
-/// that device runs on, and Send All, which asks for its own route on a second
-/// step behind a way back.
 struct DeviceTransferPopover: View {
     var problem: String? = nil
     var current: PairingRadio? = nil
-    /// Opens on the Send All step, for a send that asks again.
     var sending: Bool = false
     let onPick: (TransferDirection, PairingRadio) -> Void
     @State private var sendStep: Bool?
@@ -264,9 +218,6 @@ struct DeviceTransferPopover: View {
     }
 }
 
-/// Pair a Device's popover: the radio, then which side this device takes, in
-/// one popover at one size. The second answer opens the sheet on the PIN step
-/// it leads to, and the chevron returns to the radio with nothing picked.
 struct PairDevicePopover: View {
     var problem: String? = nil
     let onPick: (PairingRadio, TrustedDevicePairingLink.Role) -> Void
@@ -286,8 +237,6 @@ struct PairDevicePopover: View {
     }
 }
 
-/// The last screen of a pairing: the two devices are paired, and the digits
-/// both of them show.
 struct PairingDoneStep: View {
     let device: TrustedDevice
     let onDone: () -> Void

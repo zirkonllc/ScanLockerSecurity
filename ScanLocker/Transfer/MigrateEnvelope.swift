@@ -1,11 +1,3 @@
-//
-//  MigrateEnvelope.swift
-//  ScanLocker
-//
-//  A transfer as it travels: one picture, one Locker item, the envelope that
-//  holds them and what comes back when one cannot be read.
-//
-
 import Combine
 import CommonCrypto
 import CryptoKit
@@ -24,28 +16,12 @@ struct MigratePhoto: Codable {
     var sealed: Data
     var origin: PhotoOrigin
     var extraSealed: [Data]
-    /// The name each extra page was sealed under on the sending device, in
-    /// the order of `extraSealed`. Every page is bound to its own file name
-    /// as authenticated data, so the receiver needs the name to open the
-    /// page before it reseals it under a name of its own. The first page's
-    /// name is `filename`. A picture from a build that wrote no names
-    /// cannot be opened here and is refused with its name.
     var extraFilenames: [String]
-    /// True when this picture was in Vault on the sending device, so the
-    /// receiver files it in its own Vault. Without it a picture sent one
-    /// at a time would land in Home and be shareable from there: send to a
-    /// paired device, receive, share. Older builds neither write nor read
-    /// the field, and a picture arriving without it is treated as not from
-    /// Vault, which is what it was.
     var fromStayBox: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id, folderId, name, capturedAt, isSecure, filename, sealed, origin, extraSealed
         case extraFilenames
-        /// Spelled as the folder is named. An earlier build wrote this flag
-        /// under one of the folder's two earlier names, and this build reads
-        /// neither, so both devices take this build before a Vault picture
-        /// is sent between them.
         case fromStayBox
     }
 
@@ -91,25 +67,11 @@ struct MigrateLockerItem: Codable {
     var folderId: UUID?
     var isSecure: Bool?
     var origin: PhotoOrigin?
-    /// True when this item was in Vault on the sending device, so the
-    /// receiver files it in its own Vault. A single item send carries no
-    /// folders at all, so without this the item would land in Home and be
-    /// shareable from there: send to a paired device, receive, share. Older
-    /// builds neither write nor read the field, and an item arriving without
-    /// it is treated as not from Vault, which is what it was.
     var fromStayBox: Bool?
 }
 
 struct MigrateEnvelope: Codable {
     var salt: Data
-    /// Every Scan key a blob in the envelope may be sealed under, each
-    /// wrapped for the one paired device and named by its identifier in
-    /// hex: the sender's tab key, every key it holds for restored material,
-    /// and its Vault key when a Vault page travels. A page travels byte
-    /// for byte as it sits on the sender, a Locker payload is sealed under
-    /// the tab key with its identifier as the name, and the receiver opens
-    /// each under the key its own header names. Over the local link and
-    /// never the internet.
     var wrappedKeys: [String: Data]
     var folders: [ScanFolder]
     var photos: [MigratePhoto]
@@ -176,20 +138,12 @@ struct MigrateImportResult {
 enum VaultMigrateError: LocalizedError {
     case nothingToSend
     case couldNotPack(String)
-    /// The chosen contents come to more than one transfer carries.
     case overCeiling(bytes: Int)
-    /// The bytes arrived but are not a ScanLocker transfer.
     case payloadUnreadable
-    /// The envelope is fine; this iPhone's key for the sending device did
-    /// not open it.
     case keyRejected
     case pictureFailed(name: String, reason: String)
     case lockerItemFailed(title: String, reason: String)
-    /// A catalog write after the receive failed and everything that arrived
-    /// was taken back off this device.
     case nothingKept
-    /// The pictures were entered, the Locker write then failed, and the
-    /// write that would have taken the pictures back out failed too.
     case picturesKeptOnly
 
     var errorDescription: String? {
@@ -218,13 +172,6 @@ enum VaultMigrateError: LocalizedError {
 }
 
 extension VaultStore.MigrateArrival.StagedPhoto {
-    /// The catalog record this staged picture becomes, in the given folder.
-    ///
-    /// A picture the sender had in Vault takes the received origin and the
-    /// moment of the arrival, so it wears the yellow mark here and its alert
-    /// names when it came. Every other picture keeps the origin the sender
-    /// sent, a copy restored from iCloud included, since that arrives with
-    /// the flag unset. `arrivedAt` is one moment for the whole arrival.
     func record(in folderId: UUID, arrivedAt: Date) -> VaultPhoto {
         VaultPhoto(id: id,
                    folderId: folderId,
