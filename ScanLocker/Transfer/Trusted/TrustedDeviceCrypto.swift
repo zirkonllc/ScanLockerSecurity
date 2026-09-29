@@ -20,7 +20,7 @@ nonisolated enum TrustedDeviceError: LocalizedError, Equatable {
         case .storeWriteFailed:
             return "The change to Paired Devices was not saved."
         case .recordsSuspect:
-            return "Paired Devices can\u{2019}t be opened on this device. Remove them on the Security page before adding a device."
+            return "Paired Devices can\u{2019}t be opened on this device. Remove them on the Paired Devices page before adding a device."
         }
     }
 }

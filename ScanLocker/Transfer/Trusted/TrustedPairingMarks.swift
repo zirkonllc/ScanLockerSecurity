@@ -244,7 +244,7 @@ struct PairingDoneStep: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Devices Paired")
-                    .font(VaultTheme.header(20))
+                    .font(VaultTheme.display(20))
                     .foregroundColor(VaultTheme.ink)
                     .fixedSize(horizontal: false, vertical: true)
             Text("Paired with \(device.name). Both devices can now send to each other.")

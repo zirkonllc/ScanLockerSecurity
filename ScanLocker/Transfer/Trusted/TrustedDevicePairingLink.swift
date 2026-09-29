@@ -116,7 +116,7 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         status = "Waiting for the other device."
         armStallHint(radio == .remote
             ? "Still waiting. The other device picks Internet where it pairs a device, then types this code."
-            : "Still waiting. On the other device, tap Pair a Device, then Enter PIN, and pick ScanLocker-\(deviceTag).")
+            : "Still waiting. On the other device, tap Pair a Device, then \(radio.name), then Enter PIN, and pick ScanLocker-\(deviceTag).")
         armPINLifetime()
     }
 
