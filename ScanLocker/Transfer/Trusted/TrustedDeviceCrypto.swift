@@ -8,6 +8,10 @@ nonisolated enum TrustedDeviceError: LocalizedError, Equatable {
     case storeWriteFailed
     case recordsSuspect
     case lowOrderPoint
+    case cardMalformed
+    case cardIsOwn
+    case cardMissing
+    case cardChanged
 
     var errorDescription: String? {
         switch self {
@@ -21,6 +25,14 @@ nonisolated enum TrustedDeviceError: LocalizedError, Equatable {
             return "The change to Paired Devices was not saved."
         case .recordsSuspect:
             return "Paired Devices can\u{2019}t be opened on this device. Remove them on the Paired Devices page before adding a device."
+        case .cardMalformed:
+            return "That is not a whole ScanLocker pairing card. Paste the whole card, from SLPAIR1 to its end."
+        case .cardIsOwn:
+            return "That is this device\u{2019}s own card. Paste the card from the other device."
+        case .cardMissing:
+            return "This device has no card of its own yet, so show one first."
+        case .cardChanged:
+            return "This device\u{2019}s own card changed before the pairing was saved, so nothing was saved. Compare the code again."
         }
     }
 }
@@ -73,6 +85,13 @@ nonisolated enum TrustedDeviceCrypto {
         let secret = try mine.sharedSecretFromKeyAgreement(with: theirs)
         return secret.hkdfDerivedSymmetricKey(using: SHA256.self, salt: salt,
                                               sharedInfo: info, outputByteCount: 32)
+    }
+
+    static func agreementStands(myPrivate: Data, theirPublic: Data) -> Bool {
+        guard let mine = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: myPrivate),
+              let theirs = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: theirPublic),
+              let secret = try? mine.sharedSecretFromKeyAgreement(with: theirs) else { return false }
+        return secret.withUnsafeBytes { $0.contains { $0 != 0 } }
     }
 
     static func transferKey(myPrivate: Data, theirPublic: Data, salt: Data) throws -> SymmetricKey {

@@ -13,22 +13,22 @@ struct MigratePhoto: Codable {
     var capturedAt: Date
     var isSecure: Bool
     var filename: String
-    var sealed: Data
     var origin: PhotoOrigin
-    var extraSealed: [Data]
     var extraFilenames: [String]
+    var pageCount: Int
     var fromStayBox: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case id, folderId, name, capturedAt, isSecure, filename, sealed, origin, extraSealed
-        case extraFilenames
+        case id, folderId, name, capturedAt, isSecure, filename, origin
+        case extraFilenames, pageCount
         case fromStayBox
     }
 
     init(id: UUID, folderId: UUID, name: String, capturedAt: Date, isSecure: Bool,
-         filename: String, sealed: Data, origin: PhotoOrigin, extraSealed: [Data],
-         extraFilenames: [String] = [], fromStayBox: Bool? = nil) {
+         filename: String, origin: PhotoOrigin, extraFilenames: [String] = [],
+         pageCount: Int, fromStayBox: Bool? = nil) {
         self.extraFilenames = extraFilenames
+        self.pageCount = pageCount
         self.fromStayBox = fromStayBox
         self.id = id
         self.folderId = folderId
@@ -36,9 +36,7 @@ struct MigratePhoto: Codable {
         self.capturedAt = capturedAt
         self.isSecure = isSecure
         self.filename = filename
-        self.sealed = sealed
         self.origin = origin
-        self.extraSealed = extraSealed
     }
 
     init(from decoder: Decoder) throws {
@@ -49,10 +47,9 @@ struct MigratePhoto: Codable {
         capturedAt = try c.decode(Date.self, forKey: .capturedAt)
         isSecure = try c.decode(Bool.self, forKey: .isSecure)
         filename = try c.decode(String.self, forKey: .filename)
-        sealed = try c.decode(Data.self, forKey: .sealed)
         origin = try c.decodeIfPresent(PhotoOrigin.self, forKey: .origin) ?? .captured
-        extraSealed = try c.decodeIfPresent([Data].self, forKey: .extraSealed) ?? []
         extraFilenames = try c.decodeIfPresent([String].self, forKey: .extraFilenames) ?? []
+        pageCount = try c.decode(Int.self, forKey: .pageCount)
         fromStayBox = try c.decodeIfPresent(Bool.self, forKey: .fromStayBox)
     }
 }
@@ -74,34 +71,41 @@ struct MigrateEnvelope: Codable {
     var salt: Data
     var wrappedKeys: [String: Data]
     var folders: [ScanFolder]
-    var photos: [MigratePhoto]
     var selectedFolderID: UUID
     var lockerFolders: [ScanFolder]
-    var lockerItems: [MigrateLockerItem]
     var itemShare: Bool
+    var pictureCount: Int
+    var pageCount: Int
+    var lockerCount: Int
+    var byteTotal: Int
 
     enum CodingKeys: String, CodingKey {
-        case salt, wrappedKeys, folders, photos, selectedFolderID, lockerFolders, lockerItems, itemShare
+        case salt, wrappedKeys, folders, selectedFolderID, lockerFolders, itemShare
+        case pictureCount, pageCount, lockerCount, byteTotal
     }
 
     init(
         salt: Data,
         wrappedKeys: [String: Data],
         folders: [ScanFolder],
-        photos: [MigratePhoto],
         selectedFolderID: UUID,
         lockerFolders: [ScanFolder] = [],
-        lockerItems: [MigrateLockerItem] = [],
-        itemShare: Bool = false
+        itemShare: Bool = false,
+        pictureCount: Int,
+        pageCount: Int,
+        lockerCount: Int,
+        byteTotal: Int
     ) {
         self.salt = salt
         self.wrappedKeys = wrappedKeys
         self.folders = folders
-        self.photos = photos
         self.selectedFolderID = selectedFolderID
         self.lockerFolders = lockerFolders
-        self.lockerItems = lockerItems
         self.itemShare = itemShare
+        self.pictureCount = pictureCount
+        self.pageCount = pageCount
+        self.lockerCount = lockerCount
+        self.byteTotal = byteTotal
     }
 
     init(from decoder: Decoder) throws {
@@ -109,11 +113,13 @@ struct MigrateEnvelope: Codable {
         salt = try c.decode(Data.self, forKey: .salt)
         wrappedKeys = try c.decode([String: Data].self, forKey: .wrappedKeys)
         folders = try c.decode([ScanFolder].self, forKey: .folders)
-        photos = try c.decode([MigratePhoto].self, forKey: .photos)
         selectedFolderID = try c.decode(UUID.self, forKey: .selectedFolderID)
         lockerFolders = try c.decodeIfPresent([ScanFolder].self, forKey: .lockerFolders) ?? []
-        lockerItems = try c.decodeIfPresent([MigrateLockerItem].self, forKey: .lockerItems) ?? []
         itemShare = try c.decodeIfPresent(Bool.self, forKey: .itemShare) ?? false
+        pictureCount = try c.decode(Int.self, forKey: .pictureCount)
+        pageCount = try c.decode(Int.self, forKey: .pageCount)
+        lockerCount = try c.decode(Int.self, forKey: .lockerCount)
+        byteTotal = try c.decode(Int.self, forKey: .byteTotal)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -121,12 +127,21 @@ struct MigrateEnvelope: Codable {
         try c.encode(salt, forKey: .salt)
         try c.encode(wrappedKeys, forKey: .wrappedKeys)
         try c.encode(folders, forKey: .folders)
-        try c.encode(photos, forKey: .photos)
         try c.encode(selectedFolderID, forKey: .selectedFolderID)
         try c.encode(lockerFolders, forKey: .lockerFolders)
-        try c.encode(lockerItems, forKey: .lockerItems)
         try c.encode(itemShare, forKey: .itemShare)
+        try c.encode(pictureCount, forKey: .pictureCount)
+        try c.encode(pageCount, forKey: .pageCount)
+        try c.encode(lockerCount, forKey: .lockerCount)
+        try c.encode(byteTotal, forKey: .byteTotal)
     }
+}
+
+struct MigrateEnd: Codable {
+    var recordCount: Int
+    var pictureCount: Int
+    var pageCount: Int
+    var lockerCount: Int
 }
 
 struct MigrateImportResult {
