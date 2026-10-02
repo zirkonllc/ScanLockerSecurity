@@ -5,8 +5,10 @@ import Foundation
 @MainActor
 final class TrustedDevicePairingLink: NSObject, ObservableObject {
     static let bonjourType = "_sl-pair._tcp"
-    static let handshakeDeadline: TimeInterval = 20
-    static let remoteConnectDeadline: TimeInterval = 130
+    static let handshakeDeadline: TimeInterval = 60
+    static let keepaliveEvery: TimeInterval = 10
+    static let resendAfter: TimeInterval = 20
+    static let slowAfter: TimeInterval = 45
     static let pinLength = 6
     static let maxInfoBytes = 512
 
@@ -14,7 +16,8 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         let pairingID: Data
         let myKeys: TrustedDeviceCrypto.KeyPair
         let theirPublicKey: Data
-        let theirDescription: DeviceDescription
+        var theirDescription: DeviceDescription
+        var described: Bool
     }
 
     typealias FoundDevice = PairingPeer
@@ -30,6 +33,7 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
     @Published private(set) var busy = false
     @Published private(set) var radioFailed = false
     @Published private(set) var remoteSlot: String?
+    @Published private(set) var retries = 0
 
     private(set) var pin = ""
     private(set) var deviceTag = ""
@@ -47,6 +51,7 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         case accept = 0x04
         case reject = 0x05
         case info = 0x06
+        case keepalive = 0x07
 
         var bodyLength: Int? {
             switch self {
@@ -56,6 +61,7 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
             case .accept: return 32
             case .reject: return 1
             case .info: return nil
+            case .keepalive: return 0
             }
         }
     }
@@ -74,6 +80,7 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
     private static let lastMessageGrace: TimeInterval = 1
     private static let unreadable = "This device could not read the other device\u{2019}s reply"
     private static let couldNotPrepare = "This device could not start pairing"
+    private static let pairedWithoutDetails = "Paired. The other device\u{2019}s name did not arrive, so name it yourself."
     private static let retiredReason: UInt8 = 0xFF
     private static let minSealedBytes = 12 + 16
 
@@ -82,12 +89,19 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
     private var transport: PairingTransport?
     private var deadlineGeneration = 0
     private var hintGeneration = 0
-    private var lifetimeGeneration = 0
     private var enteredPIN = ""
+    private var joiningCode: RemotePairingCode?
+    private var pendingPick: (device: FoundDevice, bystanders: Set<String>)?
+    private var rescanOnNextJoin = false
+
+    private var liveness: Task<Void, Never>?
+    private var lastSent: [Data] = []
+    private var lastSentAt = Date()
+    private var stepStartedAt = Date()
+    private var committed = false
 
     private static let stallHintAfter: TimeInterval = 30
-
-    private static let pinLifetime: TimeInterval = 300
+    private static let refindDeadline: TimeInterval = 5
 
     private var pairingID = Data()
     private var joinerPub = Data()
@@ -117,7 +131,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         armStallHint(radio == .remote
             ? "Still waiting. The other device picks Internet where it pairs a device, then types this code."
             : "Still waiting. On the other device, tap Pair a Device, then \(radio.name), then Enter PIN, and pick ScanLocker-\(deviceTag).")
-        armPINLifetime()
     }
 
     func startBrowsing(radio: PairingRadio) {
@@ -147,7 +160,41 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         phase = .awaitingChallenge
         status = "Connecting to ScanLocker-\(device.tag)."
         transport.connect(to: device, timeout: Self.handshakeDeadline)
-        armDeadline()
+    }
+
+    static func current(_ device: FoundDevice, in found: [FoundDevice],
+                        besides bystanders: Set<String>) -> FoundDevice? {
+        if let same = found.first(where: { $0.id == device.id }) { return same }
+        let newcomers = found.filter { bystanders.contains($0.id) == false }
+        return newcomers.count == 1 ? newcomers.first : nil
+    }
+
+    func join(_ device: FoundDevice, besides bystanders: Set<String>, pin: String) {
+        guard role == .join, transport != nil, busy == false, outcome == nil else { return }
+        let rescanned = rescanOnNextJoin
+        rescanOnNextJoin = false
+        if rescanned { (transport as? PairingBluetoothTransport)?.rescan() }
+        if let peer = Self.current(device, in: found, besides: bystanders) {
+            join(peer, pin: pin)
+            return
+        }
+        enteredPIN = pin
+        errorText = nil
+        pinRetired = false
+        busy = true
+        pendingPick = (device, bystanders)
+        status = "Looking for a device that is showing a PIN."
+        if rescanned == false { (transport as? PairingBluetoothTransport)?.rescan() }
+        deadlineGeneration += 1
+        let generation = deadlineGeneration
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.refindDeadline))
+            guard generation == deadlineGeneration, pendingPick != nil else { return }
+            pendingPick = nil
+            busy = false
+            status = ""
+            errorText = "No device showing a PIN has been found yet. " + radio.checkLine
+        }
     }
 
     func joinRemote(code: RemotePairingCode) {
@@ -155,22 +202,24 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         transport?.stop()
         openTransport().startBrowsing(tag: deviceTag)
         enteredPIN = code.pin
+        joiningCode = code
         errorText = nil
         pinRetired = false
         busy = true
         phase = .awaitingChallenge
         status = "Reaching the other device."
-        transport?.connect(to: PairingPeer(id: code.slot, tag: ""), timeout: Self.remoteConnectDeadline)
-        armDeadline(Self.remoteConnectDeadline)
+        transport?.connect(to: PairingPeer(id: code.slot, tag: ""), timeout: Self.handshakeDeadline)
     }
 
     func stop() {
         deadlineGeneration += 1
         hintGeneration += 1
-        lifetimeGeneration += 1
+        endLiveness()
         transport?.stop()
         transport = nil
         found = []
+        pendingPick = nil
+        rescanOnNextJoin = false
         busy = false
         radioFailed = false
         remoteSlot = nil
@@ -179,16 +228,20 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         errorText = nil
         outcome = nil
         refused = false
+        committed = false
+        joiningCode = nil
+        retries = 0
+        lastSent = []
         forgetExchange()
     }
 
     private func connected() {
-        guard outcome == nil else { return }
+        guard committed == false else { return }
         switch role {
         case .host:
             guard phase == .awaitingHello else { return }
             status = "The other device connected."
-            armDeadline()
+            beginLiveness()
         case .join:
             guard phase == .awaitingChallenge else { return }
             guard let nonce = try? TrustedDeviceCrypto.randomBytes(16) else {
@@ -197,16 +250,16 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
             }
             joinerPub = myKeys.publicKey
             joinerNonce = nonce
+            beginLiveness()
             guard send(.hello, body: joinerPub + joinerNonce) else { return }
             status = "Connected. Proving the \(radio.secretWord)."
-            armDeadline()
         case nil:
             break
         }
     }
 
     private func received(_ data: Data) {
-        guard phase != .idle, phase != .done, outcome == nil else { return }
+        guard phase != .idle, phase != .done else { return }
         guard let first = data.first, let type = MessageType(rawValue: first) else {
             fail(Self.unreadable)
             return
@@ -223,6 +276,7 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
                 return
             }
         }
+        if type == .keepalive { return }
 
         switch (role, phase, type) {
         case (.host, .awaitingHello, .hello):
@@ -242,10 +296,10 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
                 return
             }
             hostPoint = point
+            advanced()
             guard send(.challenge, body: pairingID + hostPub + hostNonce + hostPoint) else { return }
             phase = .awaitingProve
             status = "Waiting for the other device to enter the \(radio.secretWord)."
-            armDeadline()
 
         case (.join, .awaitingChallenge, .challenge):
             var offset = body.startIndex
@@ -266,10 +320,10 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
                 return
             }
             sessionKey = key
+            advanced()
             guard send(.prove, body: joinerPoint + tag("join", key: key)) else { return }
             phase = .awaitingAccept
             status = "\(radio == .remote ? "Code" : "PIN") sent. Waiting for the other device."
-            armDeadline()
 
         case (.host, .awaitingProve, .prove):
             joinerPoint = Data(body.prefix(32))
@@ -280,13 +334,14 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
             }
             sessionKey = key
             if validTag(proof, label: "join", key: key) {
+                advanced()
                 guard send(.accept, body: tag("host", key: key)) else { return }
                 guard sendInfo() else { return }
                 phase = .awaitingInfo
-                status = "\(radio == .remote ? "Code" : "PIN") accepted. Exchanging device details."
-                armDeadline()
+                commit()
+                status = "\(radio == .remote ? "Code" : "PIN") accepted. Paired. Waiting for the other device\u{2019}s details."
             } else {
-                fail("The other device entered a different \(radio.secretWord)")
+                fail("The other device entered a different \(radio.secretWord)", spends: true)
             }
 
         case (.join, .awaitingAccept, .accept):
@@ -294,14 +349,16 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
                 fail("The other device did not prove it holds the \(radio.secretWord)")
                 return
             }
+            advanced()
             guard sendInfo() else { return }
             phase = .awaitingInfo
-            status = "\(radio == .remote ? "Code" : "PIN") accepted. Exchanging device details."
-            armDeadline()
+            commit()
+            status = "\(radio == .remote ? "Code" : "PIN") accepted. Paired. Waiting for the other device\u{2019}s details."
 
         case (.join, .awaitingAccept, .reject):
             pinRetired = true
             endAttempt("The other device retired its \(radio.secretWord), so the pairing stopped. Ask them to show a new one.")
+            rescanOnNextJoin = true
 
         case (_, .awaitingInfo, .info):
             guard let key = pairingKey(),
@@ -310,10 +367,24 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
                 fail("The other device's device details would not open")
                 return
             }
-            finish(theirPublicKey: theirPublicKey, description: description.clamped())
+            finish(description: description.clamped())
 
         default:
+            if Self.repeats(type, before: phase) { return }
             fail("The other device answered out of turn")
+        }
+    }
+
+    private static func repeats(_ type: MessageType, before phase: Phase) -> Bool {
+        switch (type, phase) {
+        case (.hello, .awaitingProve), (.hello, .awaitingInfo):
+            return true
+        case (.challenge, .awaitingAccept), (.challenge, .awaitingInfo):
+            return true
+        case (.prove, .awaitingInfo), (.accept, .awaitingInfo):
+            return true
+        default:
+            return false
         }
     }
 
@@ -338,21 +409,37 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
                                             transcript: transcript())
     }
 
-    private func finish(theirPublicKey: Data, description: DeviceDescription) {
+    private func commit() {
+        guard committed == false else { return }
+        committed = true
+        outcome = Outcome(pairingID: pairingID, myKeys: myKeys,
+                          theirPublicKey: theirPublicKey,
+                          theirDescription: DeviceDescription.pending, described: false)
+    }
+
+    private func finish(description: DeviceDescription) {
+        commit()
+        outcome?.theirDescription = description
+        outcome?.described = true
+        settle(saying: "Paired.")
+    }
+
+    private func settle(saying said: String) {
         deadlineGeneration += 1
+        endLiveness()
         phase = .done
         busy = false
-        status = "Paired."
-        outcome = Outcome(pairingID: pairingID, myKeys: myKeys,
-                          theirPublicKey: theirPublicKey, theirDescription: description)
+        status = said
         forgetExchange()
         transport?.stopDiscovery()
         transport?.resetConnection(after: Self.lastMessageGrace, readyForAnother: false)
     }
 
-    private func fail(_ cause: String) {
-        if role == .host, phase == .awaitingProve || phase == .awaitingInfo {
-            retire(cause: cause)
+    private func fail(_ cause: String, spends: Bool = false) {
+        if committed { return settle(saying: Self.pairedWithoutDetails) }
+        if spends, role == .host { return retire(cause: cause) }
+        if role == .host, phase != .idle {
+            endAttempt("\(cause), so this attempt stopped. The \(radio.secretWord) still stands, and the other device can try again.")
         } else {
             endAttempt("\(cause), so the pairing stopped.")
         }
@@ -366,7 +453,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
 
     private func retire(saying message: String) {
         pinRetired = true
-        lifetimeGeneration += 1
         transport?.stopAdvertising()
         let told = transport?.send(Data([MessageType.reject.rawValue, Self.retiredReason])) == true
         endAttempt(message, disconnectAfter: told ? Self.lastMessageGrace : 0)
@@ -374,6 +460,8 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
 
     private func endAttempt(_ message: String, disconnectAfter grace: TimeInterval = 0) {
         deadlineGeneration += 1
+        endLiveness()
+        lastSent = []
         forgetExchange()
         transport?.resetConnection(after: grace,
                                    readyForAnother: role == .join || pinRetired == false)
@@ -381,19 +469,43 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
         busy = false
         errorText = message
         status = role == .host && pinRetired == false ? "Waiting for the other device." : ""
-        if role == .host, pinRetired == false, outcome == nil { armPINLifetime() }
     }
 
-    private func armDeadline(_ given: TimeInterval? = nil) {
-        let seconds = given ?? Self.handshakeDeadline
+    private func beginLiveness() {
         deadlineGeneration += 1
-        let generation = deadlineGeneration
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            guard generation == deadlineGeneration, outcome == nil, phase != .idle else { return }
-            fail(seconds == Self.handshakeDeadline
-                 ? "The other device did not answer within twenty seconds"
-                 : "The other device could not be reached in time")
+        stepStartedAt = Date()
+        lastSent = []
+        liveness?.cancel()
+        liveness = Task { @MainActor [weak self] in
+            while Task.isCancelled == false {
+                try? await Task.sleep(for: .seconds(Self.keepaliveEvery))
+                guard Task.isCancelled == false, let self else { return }
+                self.tick()
+            }
+        }
+    }
+
+    private func endLiveness() {
+        liveness?.cancel()
+        liveness = nil
+    }
+
+    private func advanced() {
+        stepStartedAt = Date()
+        lastSent = []
+    }
+
+    private func tick() {
+        guard phase != .idle, phase != .done else { return endLiveness() }
+        let now = Date()
+        _ = transport?.send(Data([MessageType.keepalive.rawValue]))
+        if lastSent.isEmpty == false, now.timeIntervalSince(lastSentAt) >= Self.resendAfter {
+            lastSentAt = now
+            for message in lastSent { _ = transport?.send(message) }
+        }
+        let waited = now.timeIntervalSince(stepStartedAt)
+        if waited >= Self.slowAfter, errorText == nil, committed == false {
+            status = "Still waiting after \(Int(waited)) seconds. The link is slow, and this attempt continues until you cancel."
         }
     }
 
@@ -405,19 +517,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
             guard generation == hintGeneration, outcome == nil, phase == .idle, busy == false,
                   errorText == nil, role == .host || found.isEmpty else { return }
             status = message
-        }
-    }
-
-    private func armPINLifetime() {
-        lifetimeGeneration += 1
-        let generation = lifetimeGeneration
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(Self.pinLifetime * 1_000_000_000))
-            guard generation == lifetimeGeneration, outcome == nil, role == .host,
-                  pinRetired == false, busy == false, phase == .idle else { return }
-            retire(saying: radio == .remote
-                ? PairingRemoteTransport.lifetimeWords
-                : "Pairing waited too long, so this PIN is no longer valid. Start pairing again.")
         }
     }
 
@@ -436,7 +535,6 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
     private func refuseToPair() {
         deadlineGeneration += 1
         hintGeneration += 1
-        lifetimeGeneration += 1
         phase = .idle
         busy = false
         refused = true
@@ -447,10 +545,12 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
     private func couldNotStart() {
         deadlineGeneration += 1
         hintGeneration += 1
-        lifetimeGeneration += 1
+        endLiveness()
         transport?.stopDiscovery()
         transport?.resetConnection(after: 0, readyForAnother: false)
         phase = .idle
+        pendingPick = nil
+        rescanOnNextJoin = false
         busy = false
         status = ""
         errorText = remoteWords ?? radio.couldNotStartLine
@@ -490,6 +590,8 @@ final class TrustedDevicePairingLink: NSObject, ObservableObject {
             fail("This device could not send to the other one")
             return false
         }
+        lastSent.append(message)
+        lastSentAt = Date()
         return true
     }
 
@@ -552,12 +654,29 @@ extension TrustedDevicePairingLink: PairingTransportDelegate {
     }
 
     func pairingTransportDidDrop() {
-        guard outcome == nil, phase != .idle else { return }
-        if role == .join, phase == .awaitingChallenge, let said = remoteWords {
-            endAttempt(said)
-        } else {
-            fail("The connection to the other device dropped")
+        guard phase != .idle, phase != .done else { return }
+        if committed { return settle(saying: Self.pairedWithoutDetails) }
+        if role == .join, radio == .remote, let code = joiningCode,
+           let remote = transport as? PairingRemoteTransport, remote.retryable {
+            return reachAgain(code, after: remote.words, on: remote)
         }
+        if role == .join, phase == .awaitingChallenge, let said = remoteWords {
+            return endAttempt(said)
+        }
+        fail("The connection to the other device dropped")
+    }
+
+    private func reachAgain(_ code: RemotePairingCode, after words: String?, on remote: PairingRemoteTransport) {
+        endLiveness()
+        forgetExchange()
+        lastSent = []
+        retries += 1
+        errorText = nil
+        busy = true
+        phase = .awaitingChallenge
+        remote.connect(to: PairingPeer(id: code.slot, tag: ""), timeout: Self.handshakeDeadline)
+        let tried = "Reaching the other device again with the same code, try \(retries + 1)."
+        status = words.map { "\($0) \(tried)" } ?? tried
     }
 
     func pairingTransport(didReceive message: Data) {
@@ -567,6 +686,12 @@ extension TrustedDevicePairingLink: PairingTransportDelegate {
     func pairingTransport(didUpdate peers: [PairingPeer]) {
         found = peers
         if busy == false, peers.isEmpty == false { status = "" }
+        if let wanted = pendingPick,
+           let peer = Self.current(wanted.device, in: peers, besides: wanted.bystanders) {
+            pendingPick = nil
+            busy = false
+            join(peer, pin: enteredPIN)
+        }
     }
 
     func pairingTransportShouldAccept() -> Bool {
@@ -574,12 +699,17 @@ extension TrustedDevicePairingLink: PairingTransportDelegate {
         if accept {
             busy = true
             phase = .awaitingHello
-            armDeadline()
+            beginLiveness()
         }
         return accept
     }
 
     func pairingTransportCouldNotStart() {
         couldNotStart()
+    }
+
+    func pairingTransport(noted words: String?) {
+        guard role == .host, busy == false, outcome == nil, errorText == nil, pinRetired == false else { return }
+        status = words ?? "Waiting for the other device."
     }
 }
