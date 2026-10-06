@@ -3,7 +3,7 @@ import Foundation
 import Security
 
 enum LockerSeal {
-    static let maxPlaintextBytes = 3072
+    static let maxPlaintextBytes = 3730
     static var entryLimitBytes: Int { maxPlaintextBytes * 99 / 100 }
 
     struct PayloadBudget {

@@ -18,65 +18,114 @@ struct TrustedPINDigits: View {
     }
 }
 
+struct PairingSearchHeading: View {
+    let waits: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Looking for a Device")
+                .font(VaultTheme.header(26))
+                .foregroundColor(VaultTheme.ink)
+                .accessibilityAddTraits(.isHeader)
+            if waits {
+                Text("Waiting for another device to show a PIN...")
+                    .font(VaultTheme.body(17))
+                    .foregroundColor(VaultTheme.accent)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct PairingSearchMark: View {
     var body: some View {
         ZStack {
             Circle()
-                .fill(VaultTheme.ink.opacity(0.04))
+                .fill(VaultTheme.wifiBlue.opacity(0.10))
                 .frame(width: 168, height: 168)
             Circle()
-                .fill(VaultTheme.ink.opacity(0.07))
+                .fill(VaultTheme.wifiBlue.opacity(0.20))
                 .frame(width: 118, height: 118)
             Circle()
-                .fill(VaultTheme.mist)
+                .fill(VaultTheme.paper)
                 .frame(width: 76, height: 76)
-            Image(systemName: "iphone")
-                .font(.system(size: 32, weight: .regular))
-                .foregroundColor(VaultTheme.ink)
+            phone
         }
         .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
         .accessibilityHidden(true)
+    }
+
+    private var phone: some View {
+        let shell = RoundedRectangle(cornerRadius: 6, style: .continuous)
+        return shell
+            .fill(LinearGradient(colors: [VaultTheme.pressed, VaultTheme.popoverRow],
+                                 startPoint: .topLeading, endPoint: .bottomTrailing))
+            .overlay(shell.stroke(VaultTheme.ink, lineWidth: 3))
+            .overlay(alignment: .top) {
+                Capsule().fill(VaultTheme.ink).frame(width: 6, height: 2).padding(.top, 5)
+            }
+            .overlay(alignment: .bottom) {
+                Capsule().fill(VaultTheme.ink).frame(width: 8, height: 2).padding(.bottom, 5)
+            }
+            .frame(width: 22, height: 38)
     }
 }
 
-struct PairingStepList: View {
-    let working: String
-    let steps: [String]
+struct PairingStepStrip: View {
+    let stage: TrustedDevicePairingLink.Stage
+
+    private static let steps = TrustedDevicePairingLink.Stage.allCases
+    private static let dot: CGFloat = 12
+    private static let halo: CGFloat = 22
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            row(working: true, text: working)
-            ForEach(steps, id: \.self) { step in
-                row(working: false, text: step)
+        HStack(spacing: 0) {
+            ForEach(Self.steps, id: \.self) { step in
+                VStack(spacing: 6) {
+                    mark(for: step)
+                        .frame(width: Self.halo, height: Self.halo)
+                    Text(step.name)
+                        .font(step == stage ? VaultTheme.display(11) : VaultTheme.body(11))
+                        .foregroundColor(step == stage ? VaultTheme.ink : VaultTheme.accent)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: VaultTheme.cardRect)
-                .fill(VaultTheme.formGround)
-        )
+        .background(alignment: .top) {
+            GeometryReader { geo in
+                let column = geo.size.width / CGFloat(Self.steps.count)
+                let reach = column * (CGFloat(stage.rawValue) + 0.5)
+                Rectangle()
+                    .fill(VaultTheme.ink.opacity(0.25))
+                    .frame(width: geo.size.width - column, height: 2)
+                    .offset(x: column / 2, y: Self.halo / 2 - 1)
+                Rectangle()
+                    .fill(VaultTheme.ink)
+                    .frame(width: max(0, reach - column / 2), height: 2)
+                    .offset(x: column / 2, y: Self.halo / 2 - 1)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Step \(stage.rawValue + 1) of \(Self.steps.count), \(stage.name)")
     }
 
-    private func row(working: Bool, text: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Group {
-                if working {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: "circle")
-                        .font(.system(size: 15, weight: .regular))
-                        .foregroundColor(VaultTheme.ink.opacity(0.25))
-                }
+    @ViewBuilder
+    private func mark(for step: TrustedDevicePairingLink.Stage) -> some View {
+        if step < stage {
+            Circle().fill(VaultTheme.ink).frame(width: Self.dot, height: Self.dot)
+        } else if step == stage {
+            ZStack {
+                Circle().fill(VaultTheme.wordmarkOrange.opacity(0.22))
+                Circle().fill(VaultTheme.wordmarkOrange).frame(width: Self.dot, height: Self.dot)
             }
-            .frame(width: 20, height: 20)
-            .accessibilityHidden(true)
-            Text(text)
-                .font(VaultTheme.body(14))
-                .foregroundColor(VaultTheme.accent)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
+        } else {
+            Circle()
+                .fill(VaultTheme.paper)
+                .overlay(Circle().stroke(VaultTheme.ink.opacity(0.25), lineWidth: 2))
+                .frame(width: Self.dot, height: Self.dot)
         }
     }
 }
@@ -122,7 +171,6 @@ private struct PairingPopoverStep: View {
     let first: DiscChoice
     let second: DiscChoice
     var third: DiscChoice? = nil
-    var fourth: DiscChoice? = nil
 
     static let radioLine = "Both devices must pick the same one."
 
@@ -155,7 +203,6 @@ private struct PairingPopoverStep: View {
                     Self.stacked(first)
                     Self.stacked(second)
                     Self.stacked(third)
-                    if let fourth { Self.stacked(fourth) }
                 }
             } else {
                 HStack(alignment: .top, spacing: 10) {
@@ -184,37 +231,6 @@ struct PairingRadioPopover: View {
                            third: PairingRadio.remoteTile(enabled: remote, line: remoteLine,
                                                           current: current == .remote,
                                                           onPick: onPick))
-    }
-}
-
-struct DeviceTransferPopover: View {
-    var problem: String? = nil
-    var current: PairingRadio? = nil
-    var sending: Bool = false
-    let onPick: (TransferDirection, PairingRadio) -> Void
-    @State private var sendStep: Bool?
-
-    var body: some View {
-        if sendStep ?? sending {
-            let (wiFi, bluetooth) = PairingRadio.tiles(current: current) { onPick(.send, $0) }
-            PairingPopoverStep(title: "Send All", line: PairingPopoverStep.radioLine,
-                               problem: problem, onBack: { sendStep = false },
-                               first: wiFi, second: bluetooth,
-                               third: PairingRadio.remoteTile(enabled: true, current: current == .remote) {
-                                   onPick(.send, $0)
-                               })
-        } else {
-            let (wiFi, bluetooth) = PairingRadio.tiles(current: current) { onPick(.receive, $0) }
-            PairingPopoverStep(title: "Select Connection Method", line: PairingPopoverStep.radioLine,
-                               problem: sending ? nil : problem, first: wiFi, second: bluetooth,
-                               third: PairingRadio.remoteTile(enabled: true, current: current == .remote) {
-                                   onPick(.receive, $0)
-                               },
-                               fourth: DiscChoice(symbol: "arrow.up.right", name: "Send All",
-                                                  line: "Everything in ScanLocker, up to \(MigrateSource.ceilingName)") {
-                                   sendStep = true
-                               })
-        }
     }
 }
 

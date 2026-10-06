@@ -173,7 +173,7 @@ enum VaultMigrateError: LocalizedError {
         case .payloadUnreadable:
             return "What arrived is not a ScanLocker transfer, or it did not arrive in one piece. Start the transfer again on both devices."
         case .keyRejected:
-            return "Nothing was received. These two devices no longer recognise each other. Remove each under Paired Devices on both, pair them again and start the transfer."
+            return "Nothing was received. These two devices no longer recognise each other. Remove each under Devices & Transfers on both, pair them again and start the transfer."
         case .pictureFailed(let name, let reason):
             return "A picture named \(name) could not be saved on this device. \(reason)"
         case .lockerItemFailed(let title, let reason):

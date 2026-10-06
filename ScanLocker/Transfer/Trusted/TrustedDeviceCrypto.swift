@@ -22,9 +22,9 @@ nonisolated enum TrustedDeviceError: LocalizedError, Equatable {
         case .lowOrderPoint:
             return "\(CPace255.lowOrderRefusal), so the pairing stopped."
         case .storeWriteFailed:
-            return "The change to Paired Devices was not saved."
+            return "The change to Devices & Transfers was not saved."
         case .recordsSuspect:
-            return "Paired Devices can\u{2019}t be opened on this device. Remove them on the Paired Devices page before adding a device."
+            return "Your paired devices can\u{2019}t be opened on this device. Remove them under Devices & Transfers before adding a device."
         case .cardMalformed:
             return "That is not a whole ScanLocker pairing card. Paste the whole card, from SLPAIR1 to its end."
         case .cardIsOwn:
